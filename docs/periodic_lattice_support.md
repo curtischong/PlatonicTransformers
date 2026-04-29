@@ -14,14 +14,9 @@ This branch adds a lattice-aware attention path:
   harmonic phase `frac dot n` is wrapped modulo one, and the final RoPE angle
   is `2*pi*(frac dot n mod 1)`. Integer cell translations therefore produce
   exactly the same rotation up to floating-point roundoff.
-- `lattice_rope_mode="minimum_image"` remains available for local
-  nearest-image attention and partial periodic boundaries. It wraps
-  `pos_j - pos_i` through fractional coordinates before applying the usual
-  Cartesian RoPE frequencies.
 - Softmax attention computes lattice RoPE pairwise from `pos_j - pos_i`,
   preserving the Platonic group action while making predictions invariant to
-  integer unit-cell shifts. Reciprocal mode requires all `pbc` dimensions to be
-  true.
+  integer unit-cell shifts. All `pbc` dimensions must be true.
 - The factorized linear attention path raises a `ValueError` when `lattice` is
   supplied. That path aggregates a global key/value kernel and cannot exactly
   represent pair-specific lattice phases.

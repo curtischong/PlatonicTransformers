@@ -51,7 +51,6 @@ from platonic_transformers.models.platoformer.groups import PLATONIC_GROUPS
 from platonic_transformers.models.platoformer.lattice import (
     canonicalize_lattice,
     canonicalize_pbc,
-    minimum_image_displacement,
 )
 
 
@@ -90,10 +89,9 @@ class PlatonicConv(nn.Module):
 
         # --- Group Setup ---
         self.rope_on_values = rope_on_values
-        if lattice_rope_mode not in ("reciprocal", "minimum_image"):
+        if lattice_rope_mode != "reciprocal":
             raise ValueError(
-                "lattice_rope_mode must be 'reciprocal' or 'minimum_image', "
-                f"got {lattice_rope_mode!r}"
+                "lattice_rope_mode must be 'reciprocal'."
             )
         self.lattice_rope_mode = lattice_rope_mode
         if attention_backend not in ("scatter", "flash"):
@@ -202,8 +200,8 @@ class PlatonicConv(nn.Module):
     def _check_reciprocal_pbc(self, pbc: Tensor) -> None:
         if not torch.all(pbc):
             raise ValueError(
-                "lattice_rope_mode='reciprocal' requires all pbc dimensions to be True. "
-                "Use lattice_rope_mode='minimum_image' for partial periodic boundaries."
+                "lattice RoPE requires all pbc dimensions to be True; "
+                "partial periodic boundaries are not supported."
             )
 
     def _fractional_displacement(self, displacement: Tensor, lattice: Tensor) -> Tensor:
@@ -237,8 +235,6 @@ class PlatonicConv(nn.Module):
         edge_index: Optional[torch.Tensor] = None,
         k_knn: Optional[int] = None,
         lattice: Optional[torch.Tensor] = None,
-        pbc: Optional[torch.Tensor] = None,
-        lattice_rope_mode: Optional[str] = None,
     ) -> torch.Tensor:
         """
         Compute fully connected edges if edge_index is None, or kNN edges if k_knn is given.
@@ -287,40 +283,20 @@ class PlatonicConv(nn.Module):
             if pos is None:
                 raise ValueError("pos must be provided when lattice/PBC attention is used.")
             if self.rope_emb is not None:
-                lattice_rope_mode = lattice_rope_mode or self.lattice_rope_mode
                 displacement = pos[dst] - pos[src]
-                if lattice_rope_mode == "minimum_image":
-                    displacement = minimum_image_displacement(
-                        displacement,
-                        lattice[batch[src]],
-                        pbc[batch[src]] if pbc is not None else None,
-                    )
-                    k_dst = self.rope_emb(
-                        k_dst.view(E, G, H, D),
-                        displacement,
-                    ).reshape(E, GH, D)
-                elif lattice_rope_mode == "reciprocal":
-                    frac_displacement = self._fractional_displacement(
-                        displacement,
-                        lattice[batch[src]],
-                    )
-                    k_dst = self.rope_emb.forward_periodic(
-                        k_dst.view(E, G, H, D),
+                frac_displacement = self._fractional_displacement(
+                    displacement,
+                    lattice[batch[src]],
+                )
+                k_dst = self.rope_emb.forward_periodic(
+                    k_dst.view(E, G, H, D),
+                    frac_displacement,
+                ).reshape(E, GH, D)
+                if self.rope_on_values:
+                    v_dst = self.rope_emb.forward_periodic(
+                        v_dst.view(E, G, H, D),
                         frac_displacement,
                     ).reshape(E, GH, D)
-                else:
-                    raise ValueError(f"Unknown lattice_rope_mode: {lattice_rope_mode!r}")
-                if self.rope_on_values:
-                    if lattice_rope_mode == "minimum_image":
-                        v_dst = self.rope_emb(
-                            v_dst.view(E, G, H, D),
-                            displacement,
-                        ).reshape(E, GH, D)
-                    else:
-                        v_dst = self.rope_emb.forward_periodic(
-                            v_dst.view(E, G, H, D),
-                            frac_displacement,
-                        ).reshape(E, GH, D)
 
         scores = (q_src * k_dst).sum(-1) * D ** -0.5  # [E, GH]
 
@@ -432,13 +408,12 @@ class PlatonicConv(nn.Module):
         lattice = canonicalize_lattice(lattice, num_graphs, pos.device, pos.dtype)
         if lattice is not None:
             pbc = canonicalize_pbc(pbc, num_graphs, pos.shape[-1], pos.device)
-            if self.lattice_rope_mode == "reciprocal":
-                self._check_reciprocal_pbc(pbc)
+            self._check_reciprocal_pbc(pbc)
             if not self.attention:
                 raise ValueError(
                     "lattice/PBC support requires attention=True. The linear "
                     "attention path factorizes over nodes and cannot represent "
-                    "pair-specific minimum-image displacements."
+                    "pair-specific lattice phases."
                 )
             q_raw, k_raw, v = self._project_qkv(x)
             output = self.graph_scattered_attention(
@@ -448,8 +423,6 @@ class PlatonicConv(nn.Module):
                 batch,
                 pos=pos,
                 lattice=lattice,
-                pbc=pbc,
-                lattice_rope_mode=self.lattice_rope_mode,
             )
             return self.out_proj(output)
 
@@ -501,44 +474,32 @@ class PlatonicConv(nn.Module):
         lattice = canonicalize_lattice(lattice, B, pos.device, pos.dtype)
         if lattice is not None:
             pbc = canonicalize_pbc(pbc, B, pos.shape[-1], pos.device)
-            if self.lattice_rope_mode == "reciprocal":
-                self._check_reciprocal_pbc(pbc)
+            self._check_reciprocal_pbc(pbc)
             if not self.attention:
                 raise ValueError(
                     "lattice/PBC support requires attention=True. The linear "
                     "attention path factorizes over nodes and cannot represent "
-                    "pair-specific minimum-image displacements."
+                    "pair-specific lattice phases."
                 )
 
             q, k, v = self._project_qkv(x)
             if self.rope_emb is not None:
                 displacement = pos[:, None, :, :] - pos[:, :, None, :]
                 k = k[:, None, :, :, :, :].expand(B, S, S, self.num_G, self.effective_num_heads, self.head_dim)
-                if self.lattice_rope_mode == "minimum_image":
-                    displacement = minimum_image_displacement(
-                        displacement,
-                        lattice[:, None, None, :, :],
-                        pbc[:, None, None, :],
-                    )
-                    k = self.rope_emb(k.contiguous(), displacement)
-                else:
-                    frac_displacement = self._fractional_displacement(
-                        displacement,
-                        lattice[:, None, None, :, :],
-                    )
-                    k = self.rope_emb.forward_periodic(
-                        k.contiguous(),
-                        frac_displacement,
-                    )
+                frac_displacement = self._fractional_displacement(
+                    displacement,
+                    lattice[:, None, None, :, :],
+                )
+                k = self.rope_emb.forward_periodic(
+                    k.contiguous(),
+                    frac_displacement,
+                )
                 if self.rope_on_values:
                     v = v[:, None, :, :, :, :].expand(B, S, S, self.num_G, self.effective_num_heads, self.head_dim)
-                    if self.lattice_rope_mode == "minimum_image":
-                        v = self.rope_emb(v.contiguous(), displacement)
-                    else:
-                        v = self.rope_emb.forward_periodic(
-                            v.contiguous(),
-                            frac_displacement,
-                        )
+                    v = self.rope_emb.forward_periodic(
+                        v.contiguous(),
+                        frac_displacement,
+                    )
                 else:
                     v = v[:, None, :, :, :, :].expand(B, S, S, self.num_G, self.effective_num_heads, self.head_dim)
             else:

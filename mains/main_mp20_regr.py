@@ -46,7 +46,7 @@ def build_model(args: argparse.Namespace) -> PlatonicTransformer:
         learned_freqs=False,
         freq_init="spiral",
         rope_on_values=True,
-        lattice_rope_mode=args.lattice_rope_mode,
+        lattice_rope_mode="reciprocal",
     )
 
 
@@ -209,7 +209,6 @@ def main() -> None:
     parser.add_argument("--num-layers", type=int, default=14)
     parser.add_argument("--solid-name", default="tetrahedron")
     parser.add_argument("--rope-sigma", type=float, default=1.0)
-    parser.add_argument("--lattice-rope-mode", default="reciprocal", choices=["reciprocal", "minimum_image"])
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--drop-path-rate", type=float, default=0.0)
     parser.add_argument("--lr", type=float, default=3e-4)

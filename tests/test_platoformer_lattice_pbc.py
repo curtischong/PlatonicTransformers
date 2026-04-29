@@ -11,7 +11,6 @@ if REPO_ROOT not in sys.path:
 
 from platonic_transformers.models.platoformer.conv import PlatonicConv
 from platonic_transformers.models.platoformer.groups import PLATONIC_GROUPS
-from platonic_transformers.models.platoformer.lattice import minimum_image_displacement
 from platonic_transformers.models.platoformer.platoformer import PlatonicTransformer
 from platonic_transformers.models.platoformer.rope import PlatonicRoPE
 
@@ -21,40 +20,7 @@ def _seed():
     torch.manual_seed(0)
 
 
-def test_minimum_image_displacement_wraps_orthorhombic_and_partial_pbc():
-    lattice = torch.eye(3)
-    displacement = torch.tensor([[0.90, -0.60, 0.25]])
-
-    wrapped = minimum_image_displacement(displacement, lattice)
-    expected = torch.tensor([[-0.10, 0.40, 0.25]])
-    assert torch.allclose(wrapped, expected, atol=1e-6)
-
-    partial = minimum_image_displacement(
-        displacement,
-        lattice,
-        pbc=torch.tensor([True, False, True]),
-    )
-    expected_partial = torch.tensor([[-0.10, -0.60, 0.25]])
-    assert torch.allclose(partial, expected_partial, atol=1e-6)
-
-
-def test_minimum_image_displacement_wraps_triclinic_cells():
-    lattice = torch.tensor(
-        [
-            [2.0, 0.2, 0.0],
-            [0.0, 1.5, 0.1],
-            [0.0, 0.0, 1.0],
-        ]
-    )
-    frac = torch.tensor([[0.60, -0.55, 0.20]])
-    displacement = frac @ lattice
-    wrapped = minimum_image_displacement(displacement, lattice)
-
-    expected_frac = torch.tensor([[-0.40, 0.45, 0.20]])
-    assert torch.allclose(wrapped, expected_frac @ lattice, atol=1e-6)
-
-
-def _build_tiny_model(dense_mode=False, output_dim_vec=0, lattice_rope_mode="reciprocal"):
+def _build_tiny_model(dense_mode=False, output_dim_vec=0):
     return PlatonicTransformer(
         input_dim=4,
         input_dim_vec=0,
@@ -73,7 +39,7 @@ def _build_tiny_model(dense_mode=False, output_dim_vec=0, lattice_rope_mode="rec
         learned_freqs=False,
         freq_init="spiral",
         rope_on_values=True,
-        lattice_rope_mode=lattice_rope_mode,
+        lattice_rope_mode="reciprocal",
         dropout=0.0,
     ).eval()
 
@@ -160,30 +126,13 @@ def test_graph_platoformer_is_invariant_to_integer_cell_shifts():
     assert torch.allclose(out, out_shifted, atol=1e-5, rtol=1e-5)
 
 
-def test_minimum_image_lattice_rope_mode_remains_available():
-    model = _build_tiny_model(lattice_rope_mode="minimum_image")
-    x = torch.randn(4, 4)
-    pos = torch.rand(4, 3)
-    batch = torch.zeros(pos.shape[0], dtype=torch.long)
-    lattice = torch.eye(3).unsqueeze(0)
-    pbc = torch.ones(1, 3, dtype=torch.bool)
-    shifted = pos.clone()
-    shifted[2] += lattice[0, 1]
-
-    with torch.no_grad():
-        out, _ = model(x, pos, batch=batch, lattice=lattice, pbc=pbc)
-        out_shifted, _ = model(x, shifted, batch=batch, lattice=lattice, pbc=pbc)
-
-    assert torch.allclose(out, out_shifted, atol=1e-5, rtol=1e-5)
-
-
 def test_reciprocal_lattice_rope_rejects_partial_pbc():
-    model = _build_tiny_model(lattice_rope_mode="reciprocal")
+    model = _build_tiny_model()
     x = torch.randn(4, 4)
     pos = torch.rand(4, 3)
     batch = torch.zeros(pos.shape[0], dtype=torch.long)
 
-    with pytest.raises(ValueError, match="requires all pbc dimensions"):
+    with pytest.raises(ValueError, match="all pbc dimensions to be True"):
         model(
             x,
             pos,

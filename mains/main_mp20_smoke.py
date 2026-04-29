@@ -47,7 +47,7 @@ def build_model(args: argparse.Namespace) -> PlatonicTransformer:
         learned_freqs=False,
         freq_init="spiral",
         rope_on_values=True,
-        lattice_rope_mode=args.lattice_rope_mode,
+        lattice_rope_mode="reciprocal",
     )
 
 
@@ -140,11 +140,6 @@ def main() -> None:
     parser.add_argument("--num-layers", type=int, default=1)
     parser.add_argument("--solid-name", default="tetrahedron")
     parser.add_argument("--rope-sigma", type=float, default=1.0)
-    parser.add_argument(
-        "--lattice-rope-mode",
-        default="reciprocal",
-        choices=["reciprocal", "minimum_image"],
-    )
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
@@ -191,7 +186,7 @@ def main() -> None:
         f"MP20 smoke run: {len(train_dataset)} train / {len(val_dataset)} val, "
         f"target={args.target}, device={device}, shift={shift.item():.4f}, "
         f"scale={scale.item():.4f}, max_atoms={args.max_atoms}, parser={args.parser}, "
-        f"lattice_rope_mode={args.lattice_rope_mode}",
+        "lattice_rope_mode=reciprocal",
         flush=True,
     )
     pre_shift_err = periodic_shift_check(model, val_loader, device)
