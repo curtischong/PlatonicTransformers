@@ -1,6 +1,8 @@
 import argparse
+import json
 import os
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -122,6 +124,19 @@ def run_epoch(
 
 
 @torch.no_grad()
+def evaluate_split(
+    model: PlatonicTransformer,
+    loader: DataLoader,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+    max_batches: int | None = None,
+) -> tuple[float, float]:
+    return run_epoch(model, loader, None, shift, scale, device, amp_dtype, max_batches)
+
+
+@torch.no_grad()
 def periodic_shift_check(
     model: PlatonicTransformer,
     loader: DataLoader,
@@ -152,6 +167,7 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     epoch: int,
     best_val_mae: float,
+    best_epoch: int,
     shift: torch.Tensor,
     scale: torch.Tensor,
     args: argparse.Namespace,
@@ -163,12 +179,18 @@ def save_checkpoint(
             "optimizer": optimizer.state_dict(),
             "epoch": epoch,
             "best_val_mae": best_val_mae,
+            "best_epoch": best_epoch,
             "shift": shift,
             "scale": scale,
             "args": vars(args),
         },
         path,
     )
+
+
+def write_metrics(path: Path, metrics: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(metrics, indent=2, sort_keys=True) + "\n")
 
 
 def main() -> None:
@@ -195,10 +217,13 @@ def main() -> None:
     parser.add_argument("--amp", default="bf16", choices=["none", "bf16", "fp16"])
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--checkpoint-dir", default="checkpoints/mp20_regr")
+    parser.add_argument("--metrics-file", default=None)
+    parser.add_argument("--test-after-train", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume", default=None)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    run_start_time = time.time()
 
     torch.manual_seed(args.seed)
     torch.set_float32_matmul_precision("high")
@@ -235,6 +260,7 @@ def main() -> None:
 
     start_epoch = 1
     best_val_mae = float("inf")
+    best_epoch = 0
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt["model"])
@@ -243,6 +269,7 @@ def main() -> None:
         scale = ckpt["scale"]
         start_epoch = int(ckpt["epoch"]) + 1
         best_val_mae = float(ckpt.get("best_val_mae", best_val_mae))
+        best_epoch = int(ckpt.get("best_epoch", 0))
 
     print(
         f"MP20 full-data run: {len(train_dataset)} train / {len(val_dataset)} val, "
@@ -261,30 +288,51 @@ def main() -> None:
         )
 
     ckpt_dir = Path(args.checkpoint_dir)
+    history = []
     for epoch in range(start_epoch, args.epochs + 1):
+        epoch_start_time = time.time()
         train_loss, train_mae = run_epoch(
             model, train_loader, optimizer, shift, scale, device, amp_dtype, args.max_batches
         )
         with torch.no_grad():
-            val_loss, val_mae = run_epoch(
-                model, val_loader, None, shift, scale, device, amp_dtype, args.max_batches
+            val_loss, val_mae = evaluate_split(
+                model,
+                val_loader,
+                shift,
+                scale,
+                device,
+                amp_dtype,
+                args.max_batches,
             )
+        epoch_seconds = time.time() - epoch_start_time
 
         print(
             f"epoch {epoch:03d}: train_loss={train_loss:.5f} train_mae={train_mae:.5f} "
-            f"val_loss={val_loss:.5f} val_mae={val_mae:.5f}",
+            f"val_loss={val_loss:.5f} val_mae={val_mae:.5f} time={epoch_seconds:.1f}s",
             flush=True,
+        )
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "train_mae": train_mae,
+                "val_loss": val_loss,
+                "val_mae": val_mae,
+                "seconds": epoch_seconds,
+            }
         )
 
         improved = val_mae < best_val_mae
         if improved:
             best_val_mae = val_mae
+            best_epoch = epoch
         save_checkpoint(
             ckpt_dir / "last.pt",
             model,
             optimizer,
             epoch,
             best_val_mae,
+            best_epoch,
             shift,
             scale,
             args,
@@ -296,6 +344,7 @@ def main() -> None:
                 optimizer,
                 epoch,
                 best_val_mae,
+                best_epoch,
                 shift,
                 scale,
                 args,
@@ -309,7 +358,84 @@ def main() -> None:
             f"periodic shift max diff after training ({args.amp}): {shift_err_amp:.3e}",
             flush=True,
         )
-    print(f"best val MAE: {best_val_mae:.5f}", flush=True)
+
+    test_metrics = None
+    if args.test_after_train:
+        best_path = ckpt_dir / "best.pt"
+        if best_path.exists():
+            ckpt = torch.load(best_path, map_location=device)
+            model.load_state_dict(ckpt["model"])
+            best_epoch = int(ckpt.get("best_epoch", ckpt["epoch"]))
+            best_val_mae = float(ckpt["best_val_mae"])
+
+        test_dataset = MP20CSVRegressionDataset(
+            csv_dir / "test.csv",
+            target=args.target,
+            max_atomic_number=args.max_atomic_number,
+        )
+        test_loader = make_loader(test_dataset, args, shuffle=False)
+        test_loss, test_mae = evaluate_split(
+            model,
+            test_loader,
+            shift,
+            scale,
+            device,
+            amp_dtype,
+            args.max_batches,
+        )
+        test_shift_fp32 = periodic_shift_check(model, test_loader, device, None)
+        test_metrics = {
+            "loss": test_loss,
+            "mae": test_mae,
+            "periodic_shift_max_diff_fp32": test_shift_fp32,
+        }
+        if amp_dtype is not None:
+            test_metrics[f"periodic_shift_max_diff_{args.amp}"] = periodic_shift_check(
+                model,
+                test_loader,
+                device,
+                amp_dtype,
+            )
+        print(
+            f"test_loss={test_loss:.5f} test_mae={test_mae:.5f} "
+            f"periodic_shift_fp32={test_shift_fp32:.3e}",
+            flush=True,
+        )
+
+    elapsed_seconds = time.time() - run_start_time
+    metrics = {
+        "args": vars(args),
+        "dataset": {
+            "train": len(train_dataset),
+            "val": len(val_dataset),
+            "target": args.target,
+        },
+        "best": {
+            "epoch": best_epoch,
+            "val_mae": best_val_mae,
+        },
+        "final": {
+            "periodic_shift_max_diff_fp32": shift_err,
+        },
+        "history": history,
+        "runtime": {
+            "seconds": elapsed_seconds,
+            "hours": elapsed_seconds / 3600.0,
+        },
+    }
+    if amp_dtype is not None:
+        metrics["final"][f"periodic_shift_max_diff_{args.amp}"] = shift_err_amp
+    if test_metrics is not None:
+        metrics["dataset"]["test"] = len(test_dataset)
+        metrics["test"] = test_metrics
+
+    metrics_path = Path(args.metrics_file) if args.metrics_file else ckpt_dir / "metrics.json"
+    write_metrics(metrics_path, metrics)
+    print(
+        f"best val MAE: {best_val_mae:.5f} at epoch {best_epoch}; "
+        f"metrics written to {metrics_path}; total time={elapsed_seconds / 60.0:.1f} min",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

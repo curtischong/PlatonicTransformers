@@ -18,6 +18,7 @@ from platonic_transformers.datasets.mp20 import (
     MP20CSVRegressionDataset,
     collate_crystal_batch,
 )
+from mains.main_mp20_sklearn_baseline import item_to_features
 
 
 def test_mp20_cif_dataset_reads_lattice_and_periodic_batch(tmp_path):
@@ -78,3 +79,8 @@ def test_mp20_csv_dataset_reads_real_targets_and_cif_strings(tmp_path):
     assert item["x"].shape == (2, 118)
     assert torch.allclose(item["y"], torch.tensor([-1.25]))
     assert torch.allclose(item["band_gap"], torch.tensor(2.5))
+    assert torch.allclose(item["spacegroup_number"], torch.tensor(1.0))
+
+    features = item_to_features(item)
+    assert features.shape == (249,)
+    assert math.isclose(float(features[:118].sum()), 1.0, rel_tol=0.0, abs_tol=1e-6)

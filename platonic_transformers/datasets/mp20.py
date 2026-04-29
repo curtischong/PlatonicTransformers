@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import math
 import os
-import shlex
 import csv
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -403,6 +403,10 @@ class MP20CSVRegressionDataset(Dataset):
                 ),
                 "band_gap": torch.tensor(float(row["band_gap"]), dtype=torch.float32),
                 "e_above_hull": torch.tensor(float(row["e_above_hull"]), dtype=torch.float32),
+                "spacegroup_number": torch.tensor(
+                    float(row.get("spacegroup.number", 0.0) or 0.0),
+                    dtype=torch.float32,
+                ),
             },
         )
         if self._item_cache is not None:
