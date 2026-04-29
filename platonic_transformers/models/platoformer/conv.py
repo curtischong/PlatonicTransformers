@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 from torch import Tensor
 from typing import Optional
 
@@ -83,11 +84,18 @@ class PlatonicConv(nn.Module):
         use_key: bool = False,
         rope_on_values: bool = False,
         attention_backend: str = "scatter",
+        lattice_rope_mode: str = "reciprocal",
     ):
         super().__init__()
 
         # --- Group Setup ---
         self.rope_on_values = rope_on_values
+        if lattice_rope_mode not in ("reciprocal", "minimum_image"):
+            raise ValueError(
+                "lattice_rope_mode must be 'reciprocal' or 'minimum_image', "
+                f"got {lattice_rope_mode!r}"
+            )
+        self.lattice_rope_mode = lattice_rope_mode
         if attention_backend not in ("scatter", "flash"):
             raise ValueError(
                 f"attention_backend must be 'scatter' or 'flash', got {attention_backend!r}"
@@ -169,6 +177,35 @@ class PlatonicConv(nn.Module):
 
         return q, k, v
 
+    def _periodic_reciprocal_frequencies(self, lattice: Tensor) -> Tensor:
+        """Return Cartesian reciprocal vectors for integer RoPE harmonics.
+
+        With row-vector cells ``r = frac @ lattice``, each mode ``n`` needs a
+        Cartesian vector ``g`` satisfying ``lattice @ g = 2*pi*n``. Then
+        ``r dot g = 2*pi*(frac dot n)``, so integer cell translations change
+        the phase by an exact multiple of ``2*pi``.
+        """
+        if self.rope_emb is None:
+            raise ValueError("reciprocal lattice RoPE requires freq_sigma to be set.")
+
+        modes = self.rope_emb.periodic_modes.to(device=lattice.device, dtype=lattice.dtype)
+        rhs = (2.0 * math.pi * modes).reshape(-1, self.rope_emb.spatial_dims).transpose(0, 1)
+        rhs = rhs.expand(*lattice.shape[:-2], rhs.shape[-2], rhs.shape[-1])
+        freqs = torch.linalg.solve(lattice, rhs).transpose(-1, -2)
+        return freqs.reshape(
+            *lattice.shape[:-2],
+            self.effective_num_heads,
+            self.rope_emb.num_pairs,
+            self.rope_emb.spatial_dims,
+        )
+
+    def _check_reciprocal_pbc(self, pbc: Tensor) -> None:
+        if not torch.all(pbc):
+            raise ValueError(
+                "lattice_rope_mode='reciprocal' requires all pbc dimensions to be True. "
+                "Use lattice_rope_mode='minimum_image' for partial periodic boundaries."
+            )
+
     def _forward_shared(self, x: Tensor, pos: Tensor):
         """Shared logic for projections and absolute-position RoPE application."""
         q, k, v = self._project_qkv(x)
@@ -192,6 +229,7 @@ class PlatonicConv(nn.Module):
         k_knn: Optional[int] = None,
         lattice: Optional[torch.Tensor] = None,
         pbc: Optional[torch.Tensor] = None,
+        lattice_rope_mode: Optional[str] = None,
     ) -> torch.Tensor:
         """
         Compute fully connected edges if edge_index is None, or kNN edges if k_knn is given.
@@ -240,21 +278,41 @@ class PlatonicConv(nn.Module):
             if pos is None:
                 raise ValueError("pos must be provided when lattice/PBC attention is used.")
             if self.rope_emb is not None:
+                lattice_rope_mode = lattice_rope_mode or self.lattice_rope_mode
                 displacement = pos[dst] - pos[src]
-                displacement = minimum_image_displacement(
-                    displacement,
-                    lattice[batch[src]],
-                    pbc[batch[src]] if pbc is not None else None,
-                )
-                k_dst = self.rope_emb(
-                    k_dst.view(E, G, H, D),
-                    displacement,
-                ).reshape(E, GH, D)
-                if self.rope_on_values:
-                    v_dst = self.rope_emb(
-                        v_dst.view(E, G, H, D),
+                if lattice_rope_mode == "minimum_image":
+                    displacement = minimum_image_displacement(
+                        displacement,
+                        lattice[batch[src]],
+                        pbc[batch[src]] if pbc is not None else None,
+                    )
+                    k_dst = self.rope_emb(
+                        k_dst.view(E, G, H, D),
                         displacement,
                     ).reshape(E, GH, D)
+                elif lattice_rope_mode == "reciprocal":
+                    reciprocal_freqs = self._periodic_reciprocal_frequencies(lattice[batch[src]])
+                    k_dst = self.rope_emb.forward_with_frequencies(
+                        k_dst.view(E, G, H, D),
+                        displacement,
+                        reciprocal_freqs,
+                        rotate_frequencies=False,
+                    ).reshape(E, GH, D)
+                else:
+                    raise ValueError(f"Unknown lattice_rope_mode: {lattice_rope_mode!r}")
+                if self.rope_on_values:
+                    if lattice_rope_mode == "minimum_image":
+                        v_dst = self.rope_emb(
+                            v_dst.view(E, G, H, D),
+                            displacement,
+                        ).reshape(E, GH, D)
+                    else:
+                        v_dst = self.rope_emb.forward_with_frequencies(
+                            v_dst.view(E, G, H, D),
+                            displacement,
+                            reciprocal_freqs,
+                            rotate_frequencies=False,
+                        ).reshape(E, GH, D)
 
         scores = (q_src * k_dst).sum(-1) * D ** -0.5  # [E, GH]
 
@@ -366,6 +424,8 @@ class PlatonicConv(nn.Module):
         lattice = canonicalize_lattice(lattice, num_graphs, pos.device, pos.dtype)
         if lattice is not None:
             pbc = canonicalize_pbc(pbc, num_graphs, pos.shape[-1], pos.device)
+            if self.lattice_rope_mode == "reciprocal":
+                self._check_reciprocal_pbc(pbc)
             if not self.attention:
                 raise ValueError(
                     "lattice/PBC support requires attention=True. The linear "
@@ -381,6 +441,7 @@ class PlatonicConv(nn.Module):
                 pos=pos,
                 lattice=lattice,
                 pbc=pbc,
+                lattice_rope_mode=self.lattice_rope_mode,
             )
             return self.out_proj(output)
 
@@ -432,6 +493,8 @@ class PlatonicConv(nn.Module):
         lattice = canonicalize_lattice(lattice, B, pos.device, pos.dtype)
         if lattice is not None:
             pbc = canonicalize_pbc(pbc, B, pos.shape[-1], pos.device)
+            if self.lattice_rope_mode == "reciprocal":
+                self._check_reciprocal_pbc(pbc)
             if not self.attention:
                 raise ValueError(
                     "lattice/PBC support requires attention=True. The linear "
@@ -442,16 +505,33 @@ class PlatonicConv(nn.Module):
             q, k, v = self._project_qkv(x)
             if self.rope_emb is not None:
                 displacement = pos[:, None, :, :] - pos[:, :, None, :]
-                displacement = minimum_image_displacement(
-                    displacement,
-                    lattice[:, None, None, :, :],
-                    pbc[:, None, None, :],
-                )
                 k = k[:, None, :, :, :, :].expand(B, S, S, self.num_G, self.effective_num_heads, self.head_dim)
-                k = self.rope_emb(k.contiguous(), displacement)
+                if self.lattice_rope_mode == "minimum_image":
+                    displacement = minimum_image_displacement(
+                        displacement,
+                        lattice[:, None, None, :, :],
+                        pbc[:, None, None, :],
+                    )
+                    k = self.rope_emb(k.contiguous(), displacement)
+                else:
+                    reciprocal_freqs = self._periodic_reciprocal_frequencies(lattice)[:, None, None]
+                    k = self.rope_emb.forward_with_frequencies(
+                        k.contiguous(),
+                        displacement,
+                        reciprocal_freqs,
+                        rotate_frequencies=False,
+                    )
                 if self.rope_on_values:
                     v = v[:, None, :, :, :, :].expand(B, S, S, self.num_G, self.effective_num_heads, self.head_dim)
-                    v = self.rope_emb(v.contiguous(), displacement)
+                    if self.lattice_rope_mode == "minimum_image":
+                        v = self.rope_emb(v.contiguous(), displacement)
+                    else:
+                        v = self.rope_emb.forward_with_frequencies(
+                            v.contiguous(),
+                            displacement,
+                            reciprocal_freqs,
+                            rotate_frequencies=False,
+                        )
                 else:
                     v = v[:, None, :, :, :, :].expand(B, S, S, self.num_G, self.effective_num_heads, self.head_dim)
             else:

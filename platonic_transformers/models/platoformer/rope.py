@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import math
+import itertools
 from torch import Tensor
 
 # This assumes the PLATONIC_GROUPS dictionary from the previous problem is available.
@@ -82,6 +83,7 @@ class PlatonicRoPE(nn.Module):
             self.register_parameter("freqs", nn.Parameter(freqs))
         else:
             self.register_buffer("freqs", freqs)
+        self.register_buffer("periodic_modes", self._create_periodic_integer_modes())
 
     def forward(self, x: Tensor, pos: Tensor, inverse: bool = False) -> Tensor:
         """
@@ -99,16 +101,46 @@ class PlatonicRoPE(nn.Module):
         Returns:
             Tensor: The rotated input tensor `x_rotated` of the same shape (..., G, H, D_h).
         """
+        return self.forward_with_frequencies(x, pos, self.freqs, inverse=inverse)
+
+    def forward_with_frequencies(
+        self,
+        x: Tensor,
+        pos: Tensor,
+        freqs: Tensor,
+        inverse: bool = False,
+        rotate_frequencies: bool = True,
+    ) -> Tensor:
+        """Apply RoPE using caller-supplied frequency vectors.
+
+        ``freqs`` may be the usual ``[H, F, D]`` tensor or a tensor with leading
+        dimensions broadcastable to ``x``/``pos``, such as reciprocal-lattice
+        frequencies with shape ``[E, H, F, D]`` for pairwise periodic attention.
+        Set ``rotate_frequencies=False`` for lattice-torus phases that should be
+        shared across the Platonic frame axis.
+        """
         # 1. --- Unpack and Validate Shapes ---
         *leading_dims, G, H, D_h = x.shape
         if G != self.num_G or H != self.num_heads or D_h != self.head_dim:
             raise ValueError(f"Input shape {x.shape} does not match expected shape (..., {self.num_G}, {self.num_heads}, {self.head_dim}).")
 
         # 2. --- Compute Rotated frequencies ---
-        freqs_rotated = torch.einsum('gde, hfe -> ghfd', self.group_elements, self.freqs)
+        freqs = freqs.to(device=x.device, dtype=x.dtype)
+        if not rotate_frequencies:
+            if freqs.ndim == 3:
+                angles = torch.einsum('...d, hfd -> ...hf', pos, freqs)
+            else:
+                angles = torch.einsum('...d, ...hfd -> ...hf', pos, freqs)
+            angles = angles.unsqueeze(-3)
+        else:
+            if freqs.ndim == 3:
+                freqs_rotated = torch.einsum('gde, hfe -> ghfd', self.group_elements, freqs)
+                angles = torch.einsum('...d, ghfd -> ...ghf', pos, freqs_rotated)
+            else:
+                freqs_rotated = torch.einsum('gde, ...hfe -> ...ghfd', self.group_elements, freqs)
+                angles = torch.einsum('...d, ...ghfd -> ...ghf', pos, freqs_rotated)
 
         # Compute rotation angles for each rotated position and each base head.
-        angles = torch.einsum('...d, ghfd -> ...ghf', pos, freqs_rotated)
         cos_angles = torch.cos(angles)
         sin_angles = torch.sin(angles)
         if inverse:
@@ -135,6 +167,29 @@ class PlatonicRoPE(nn.Module):
         x_out = x_rotated_pairs.view(*leading_dims, self.num_G, self.num_heads, self.head_dim)
         
         return x_out
+
+    def _create_periodic_integer_modes(self) -> Tensor:
+        """Create low-frequency integer harmonics for reciprocal-lattice RoPE."""
+        total = self.num_heads * self.num_pairs
+        modes = []
+        radius = 1
+        while len(modes) < total:
+            candidates = []
+            for vec in itertools.product(
+                range(-radius, radius + 1),
+                repeat=self.spatial_dims,
+            ):
+                if all(v == 0 for v in vec):
+                    continue
+                if max(abs(v) for v in vec) != radius:
+                    continue
+                candidates.append(vec)
+            candidates.sort(key=lambda v: (sum(x * x for x in v), sum(abs(x) for x in v), v))
+            modes.extend(candidates)
+            radius += 1
+
+        modes = torch.tensor(modes[:total], dtype=torch.float32)
+        return modes.view(self.num_heads, self.num_pairs, self.spatial_dims)
 
     def _create_random_frequencies(self) -> Tensor:
         return torch.randn(self.num_heads, self.num_pairs, self.spatial_dims) * self.freq_sigma

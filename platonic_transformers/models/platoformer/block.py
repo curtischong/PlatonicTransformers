@@ -123,6 +123,7 @@ class PlatonicBlock(nn.Module):
         use_key: bool = False,
         rope_on_values: bool = False,
         attention_backend: str = "scatter",
+        lattice_rope_mode: str = "reciprocal",
     ) -> None:
         super().__init__()
 
@@ -157,6 +158,7 @@ class PlatonicBlock(nn.Module):
             use_key=use_key,
             rope_on_values=rope_on_values,
             attention_backend=attention_backend,
+            lattice_rope_mode=lattice_rope_mode,
         )
 
         # Equivariant Feed-Forward Network

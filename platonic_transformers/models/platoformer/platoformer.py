@@ -69,6 +69,7 @@ class PlatonicTransformer(nn.Module):
         use_key: bool = False,
         rope_on_values: bool = False,
         attention_backend: str = "scatter",  # "scatter" | "flash"
+        lattice_rope_mode: str = "reciprocal",
         activation: str = "gelu",
     ):
         super().__init__()
@@ -132,6 +133,7 @@ class PlatonicTransformer(nn.Module):
                 use_key=use_key,
                 rope_on_values=rope_on_values,
                 attention_backend=attention_backend,
+                lattice_rope_mode=lattice_rope_mode,
             ))
 
         if ffn_readout:
