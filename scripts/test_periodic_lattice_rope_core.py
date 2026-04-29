@@ -20,21 +20,20 @@ import math
 import numpy as np
 import torch
 from pymatgen.core import Lattice
+from pymatgen.util.testing import PymatgenTest
 
 
-def make_triclinic_lattice(batch_size: int, device: torch.device) -> torch.Tensor:
-    """Create non-orthogonal row-vector cell matrices with pymatgen."""
-    lengths = 1.6 + 2.4 * torch.rand(batch_size, 3)
-    angles = 62.0 + 48.0 * torch.rand(batch_size, 3)
+def pymatgen_nonorthogonal_lattices() -> list[Lattice]:
+    """Deterministic pymatgen structure fixtures with skew periodic cells."""
+    structure_names = ("Si", "Graphite", "LiFePO4", "TiO2")
+    return [PymatgenTest.get_structure(name).lattice for name in structure_names]
+
+
+def make_lattice_batch(batch_size: int, device: torch.device, offset: int = 0) -> torch.Tensor:
+    """Create a batch of non-orthogonal row-vector cell matrices."""
+    fixtures = pymatgen_nonorthogonal_lattices()
     matrices = np.stack([
-        Lattice.from_parameters(
-            lengths[i, 0].item(),
-            lengths[i, 1].item(),
-            lengths[i, 2].item(),
-            angles[i, 0].item(),
-            angles[i, 1].item(),
-            angles[i, 2].item(),
-        ).matrix
+        fixtures[(offset + i) % len(fixtures)].matrix
         for i in range(batch_size)
     ])
     return torch.tensor(matrices, dtype=torch.float32, device=device)
@@ -130,8 +129,8 @@ def pymatgen_periodic_distances(frac: torch.Tensor, lattice: torch.Tensor) -> to
     return torch.tensor(distances, dtype=frac.dtype, device=frac.device)
 
 
-def check_triclinic_roundtrip(batch_size: int, num_atoms: int, device: torch.device) -> None:
-    lattice = make_triclinic_lattice(batch_size, device)
+def check_nonorthogonal_roundtrip(batch_size: int, num_atoms: int, device: torch.device) -> None:
+    lattice = make_lattice_batch(batch_size, device)
     frac = torch.rand(batch_size, num_atoms, 3, device=device)
     cart = frac_to_cart(frac, lattice)
 
@@ -142,14 +141,14 @@ def check_triclinic_roundtrip(batch_size: int, num_atoms: int, device: torch.dev
 
     off_diag_idx = torch.tril_indices(3, 3, offset=-1, device=device)
     off_diagonal = lattice[:, off_diag_idx[0], off_diag_idx[1]].abs().max().item()
-    print(f"triclinic roundtrip max error: {err:.3e}")
+    print(f"non-orthogonal roundtrip max error: {err:.3e}")
     print(f"max off-diagonal lattice term: {off_diagonal:.3f}")
     assert off_diagonal > 0.05
     assert err < 1e-5
 
 
 def check_integer_shift_rope_invariance(batch_size: int, num_atoms: int, device: torch.device) -> None:
-    lattice = make_triclinic_lattice(batch_size, device)
+    lattice = make_lattice_batch(batch_size, device, offset=1)
     frac = torch.rand(batch_size, num_atoms, 3, device=device)
     cart = frac_to_cart(frac, lattice)
 
@@ -177,8 +176,8 @@ def check_integer_shift_rope_invariance(batch_size: int, num_atoms: int, device:
 
 def check_lattice_parameters_are_needed(batch_size: int, num_atoms: int, device: torch.device) -> None:
     frac = torch.rand(batch_size, num_atoms, 3, device=device)
-    lattice_a = make_triclinic_lattice(batch_size, device)
-    lattice_b = make_triclinic_lattice(batch_size, device)
+    lattice_a = make_lattice_batch(batch_size, device)
+    lattice_b = make_lattice_batch(batch_size, device, offset=1)
     cart_a = frac_to_cart(frac, lattice_a)
     cart_b = frac_to_cart(frac, lattice_b)
 
@@ -223,7 +222,7 @@ def main() -> None:
     device = torch.device(args.device)
     print(f"device={device}")
 
-    check_triclinic_roundtrip(args.batch_size, args.num_atoms, device)
+    check_nonorthogonal_roundtrip(args.batch_size, args.num_atoms, device)
     check_integer_shift_rope_invariance(args.batch_size, args.num_atoms, device)
     check_lattice_parameters_are_needed(args.batch_size, args.num_atoms, device)
     print("all periodic lattice RoPE math checks passed")
