@@ -156,6 +156,7 @@ dmypy.json
 *.h5
 *.tar
 *.tar.gz
+checkpoints/
 
 # Wandb logs and run files
 wandb/

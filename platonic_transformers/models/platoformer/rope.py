@@ -168,6 +168,42 @@ class PlatonicRoPE(nn.Module):
         
         return x_out
 
+    def forward_periodic(self, x: Tensor, frac: Tensor, inverse: bool = False) -> Tensor:
+        """Apply strict periodic RoPE from fractional lattice displacements.
+
+        Integer lattice shifts change ``frac`` by an integer vector. We reduce
+        each harmonic phase modulo one before applying ``2*pi`` so positions
+        separated by a cell vector produce identical rotations even in reduced
+        precision.
+        """
+        *leading_dims, G, H, D_h = x.shape
+        if G != self.num_G or H != self.num_heads or D_h != self.head_dim:
+            raise ValueError(
+                f"Input shape {x.shape} does not match expected shape "
+                f"(..., {self.num_G}, {self.num_heads}, {self.head_dim})."
+            )
+
+        phase_dtype = torch.float32 if x.dtype in (torch.float16, torch.bfloat16) else x.dtype
+        modes = self.periodic_modes.to(device=x.device, dtype=phase_dtype)
+        phase = torch.einsum("...d,hfd->...hf", frac.to(dtype=phase_dtype), modes)
+        phase = phase - torch.floor(phase + 0.5)
+        angles = phase.unsqueeze(-3) * (2.0 * math.pi)
+        cos_angles = torch.cos(angles).to(dtype=x.dtype)
+        sin_angles = torch.sin(angles).to(dtype=x.dtype)
+        if inverse:
+            sin_angles = -sin_angles
+
+        x_reshaped = x.view(*leading_dims, self.num_G, self.num_heads, self.num_pairs, 2)
+        x0, x1 = x_reshaped.unbind(dim=-1)
+        x_rotated_0 = x0 * cos_angles - x1 * sin_angles
+        x_rotated_1 = x0 * sin_angles + x1 * cos_angles
+        return torch.stack([x_rotated_0, x_rotated_1], dim=-1).view(
+            *leading_dims,
+            self.num_G,
+            self.num_heads,
+            self.head_dim,
+        )
+
     def _create_periodic_integer_modes(self) -> Tensor:
         """Create low-frequency integer harmonics for reciprocal-lattice RoPE."""
         total = self.num_heads * self.num_pairs

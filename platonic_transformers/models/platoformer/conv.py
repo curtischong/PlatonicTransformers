@@ -206,6 +206,15 @@ class PlatonicConv(nn.Module):
                 "Use lattice_rope_mode='minimum_image' for partial periodic boundaries."
             )
 
+    def _fractional_displacement(self, displacement: Tensor, lattice: Tensor) -> Tensor:
+        frac = torch.linalg.solve(
+            lattice.double().transpose(-1, -2),
+            displacement.double().unsqueeze(-1),
+        ).squeeze(-1)
+        if displacement.dtype in (torch.float16, torch.bfloat16):
+            return frac.float()
+        return frac.to(dtype=displacement.dtype)
+
     def _forward_shared(self, x: Tensor, pos: Tensor):
         """Shared logic for projections and absolute-position RoPE application."""
         q, k, v = self._project_qkv(x)
@@ -291,12 +300,13 @@ class PlatonicConv(nn.Module):
                         displacement,
                     ).reshape(E, GH, D)
                 elif lattice_rope_mode == "reciprocal":
-                    reciprocal_freqs = self._periodic_reciprocal_frequencies(lattice[batch[src]])
-                    k_dst = self.rope_emb.forward_with_frequencies(
-                        k_dst.view(E, G, H, D),
+                    frac_displacement = self._fractional_displacement(
                         displacement,
-                        reciprocal_freqs,
-                        rotate_frequencies=False,
+                        lattice[batch[src]],
+                    )
+                    k_dst = self.rope_emb.forward_periodic(
+                        k_dst.view(E, G, H, D),
+                        frac_displacement,
                     ).reshape(E, GH, D)
                 else:
                     raise ValueError(f"Unknown lattice_rope_mode: {lattice_rope_mode!r}")
@@ -307,11 +317,9 @@ class PlatonicConv(nn.Module):
                             displacement,
                         ).reshape(E, GH, D)
                     else:
-                        v_dst = self.rope_emb.forward_with_frequencies(
+                        v_dst = self.rope_emb.forward_periodic(
                             v_dst.view(E, G, H, D),
-                            displacement,
-                            reciprocal_freqs,
-                            rotate_frequencies=False,
+                            frac_displacement,
                         ).reshape(E, GH, D)
 
         scores = (q_src * k_dst).sum(-1) * D ** -0.5  # [E, GH]
@@ -514,23 +522,22 @@ class PlatonicConv(nn.Module):
                     )
                     k = self.rope_emb(k.contiguous(), displacement)
                 else:
-                    reciprocal_freqs = self._periodic_reciprocal_frequencies(lattice)[:, None, None]
-                    k = self.rope_emb.forward_with_frequencies(
-                        k.contiguous(),
+                    frac_displacement = self._fractional_displacement(
                         displacement,
-                        reciprocal_freqs,
-                        rotate_frequencies=False,
+                        lattice[:, None, None, :, :],
+                    )
+                    k = self.rope_emb.forward_periodic(
+                        k.contiguous(),
+                        frac_displacement,
                     )
                 if self.rope_on_values:
                     v = v[:, None, :, :, :, :].expand(B, S, S, self.num_G, self.effective_num_heads, self.head_dim)
                     if self.lattice_rope_mode == "minimum_image":
                         v = self.rope_emb(v.contiguous(), displacement)
                     else:
-                        v = self.rope_emb.forward_with_frequencies(
+                        v = self.rope_emb.forward_periodic(
                             v.contiguous(),
-                            displacement,
-                            reciprocal_freqs,
-                            rotate_frequencies=False,
+                            frac_displacement,
                         )
                 else:
                     v = v[:, None, :, :, :, :].expand(B, S, S, self.num_G, self.effective_num_heads, self.head_dim)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import shlex
+import csv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -116,8 +117,8 @@ def _det3(cell: list[list[float]]) -> float:
     )
 
 
-def _fast_read_cif(path: Path) -> _Crystal:
-    lines = path.read_text().splitlines()
+def _fast_parse_cif_text(cif: str, source: str = "<cif>") -> _Crystal:
+    lines = cif.splitlines()
     scalars: dict[str, str] = {}
     atom_headers: list[str] | None = None
     atom_rows: list[list[str]] = []
@@ -159,7 +160,7 @@ def _fast_read_cif(path: Path) -> _Crystal:
         i += 1
 
     if atom_headers is None:
-        raise ValueError(f"No atom_site fractional-coordinate loop found in {path}")
+        raise ValueError(f"No atom_site fractional-coordinate loop found in {source}")
 
     a = _parse_cif_number(scalars["_cell_length_a"])
     b = _parse_cif_number(scalars["_cell_length_b"])
@@ -173,7 +174,7 @@ def _fast_read_cif(path: Path) -> _Crystal:
     col = {name: idx for idx, name in enumerate(atom_headers)}
     symbol_col = col.get("_atom_site_type_symbol", col.get("_atom_site_label"))
     if symbol_col is None:
-        raise ValueError(f"No atom-site element column found in {path}")
+        raise ValueError(f"No atom-site element column found in {source}")
     x_col = col["_atom_site_fract_x"]
     y_col = col["_atom_site_fract_y"]
     z_col = col["_atom_site_fract_z"]
@@ -183,7 +184,7 @@ def _fast_read_cif(path: Path) -> _Crystal:
     for row in atom_rows:
         symbol = "".join(ch for ch in row[symbol_col] if ch.isalpha())
         if symbol not in _ELEMENT_TO_Z:
-            raise ValueError(f"Unknown element symbol {symbol!r} in {path}")
+            raise ValueError(f"Unknown element symbol {symbol!r} in {source}")
         frac = [
             _parse_cif_number(row[x_col]),
             _parse_cif_number(row[y_col]),
@@ -197,6 +198,43 @@ def _fast_read_cif(path: Path) -> _Crystal:
         cart_coords.append(cart)
 
     return _Crystal(atomic_numbers, cart_coords, cell, volume)
+
+
+def _fast_read_cif(path: Path) -> _Crystal:
+    return _fast_parse_cif_text(path.read_text(), source=str(path))
+
+
+def _crystal_to_item(
+    structure: _Crystal,
+    *,
+    material_id: str,
+    target_value: float,
+    max_atomic_number: int,
+    properties: Optional[dict[str, object]] = None,
+) -> dict[str, object]:
+    atomic_numbers = torch.tensor(structure.atomic_numbers, dtype=torch.long)
+    num_atoms = len(atomic_numbers)
+
+    x = torch.zeros(num_atoms, max_atomic_number, dtype=torch.float32)
+    valid = (atomic_numbers >= 1) & (atomic_numbers <= max_atomic_number)
+    if valid.any():
+        atom_rows = torch.arange(num_atoms)[valid]
+        x[atom_rows, atomic_numbers[valid] - 1] = 1.0
+
+    item = {
+        "pos": torch.tensor(structure.cart_coords, dtype=torch.float32),
+        "x": x,
+        "y": torch.tensor([target_value], dtype=torch.float32),
+        "cell": torch.tensor(structure.cell, dtype=torch.float32),
+        "pbc": torch.ones(3, dtype=torch.bool),
+        "num_atoms": torch.tensor(num_atoms, dtype=torch.long),
+        "atomic_numbers": atomic_numbers,
+        "material_id": material_id,
+        "volume": torch.tensor(float(structure.volume), dtype=torch.float32),
+    }
+    if properties:
+        item.update(properties)
+    return item
 
 
 class MP20CIFDataset(Dataset):
@@ -272,31 +310,13 @@ class MP20CIFDataset(Dataset):
         if structure is None:
             structure = self._read_structure(path)
 
-        atomic_numbers = torch.tensor(structure.atomic_numbers, dtype=torch.long)
-        num_atoms = len(atomic_numbers)
-
-        x = torch.zeros(num_atoms, self.max_atomic_number, dtype=torch.float32)
-        valid = (atomic_numbers >= 1) & (atomic_numbers <= self.max_atomic_number)
-        if valid.any():
-            atom_rows = torch.arange(num_atoms)[valid]
-            x[atom_rows, atomic_numbers[valid] - 1] = 1.0
-
-        pos = torch.tensor(structure.cart_coords, dtype=torch.float32)
-        cell = torch.tensor(structure.cell, dtype=torch.float32)
-        volume = float(structure.volume)
-        y = torch.tensor([self._target_value(volume, num_atoms)], dtype=torch.float32)
-
-        return {
-            "pos": pos,
-            "x": x,
-            "y": y,
-            "cell": cell,
-            "pbc": torch.ones(3, dtype=torch.bool),
-            "num_atoms": torch.tensor(num_atoms, dtype=torch.long),
-            "atomic_numbers": atomic_numbers,
-            "material_id": path.stem.replace("MP_", ""),
-            "volume": torch.tensor(volume, dtype=torch.float32),
-        }
+        target_value = self._target_value(float(structure.volume), len(structure.atomic_numbers))
+        return _crystal_to_item(
+            structure,
+            material_id=path.stem.replace("MP_", ""),
+            target_value=target_value,
+            max_atomic_number=self.max_atomic_number,
+        )
 
     def _read_structure(self, path: Path) -> _Crystal:
         if self.parser == "fast":
@@ -323,6 +343,71 @@ class MP20CIFDataset(Dataset):
             "target must be one of 'log_volume_per_atom', 'volume_per_atom', "
             f"'volume', or 'num_atoms', got {self.target!r}"
         )
+
+
+class MP20CSVRegressionDataset(Dataset):
+    """CSV-backed MP20 regression dataset with real MP benchmark labels."""
+
+    def __init__(
+        self,
+        csv_path: str | os.PathLike,
+        *,
+        target: str = "formation_energy_per_atom",
+        max_atomic_number: int = 118,
+        limit: Optional[int] = None,
+        preload: bool = True,
+    ) -> None:
+        self.csv_path = Path(csv_path)
+        self.target = target
+        self.max_atomic_number = max_atomic_number
+        self.rows: list[dict[str, str]] = []
+        self.targets: list[float] = []
+        self._item_cache: list[Optional[dict[str, object]]] | None = [] if preload else None
+
+        with open(self.csv_path, newline="") as handle:
+            reader = csv.DictReader(handle)
+            if target not in (reader.fieldnames or []):
+                raise ValueError(
+                    f"Target {target!r} not found in {self.csv_path}. "
+                    f"Available columns: {reader.fieldnames}"
+                )
+            for row in reader:
+                self.rows.append(row)
+                self.targets.append(float(row[target]))
+                if self._item_cache is not None:
+                    self._item_cache.append(None)
+                if limit is not None and len(self.rows) >= int(limit):
+                    break
+
+        if not self.rows:
+            raise FileNotFoundError(f"No rows found in {self.csv_path}")
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, idx: int) -> dict[str, object]:
+        if self._item_cache is not None and self._item_cache[idx] is not None:
+            return self._item_cache[idx]
+
+        row = self.rows[idx]
+        material_id = row.get("material_id", f"row_{idx}")
+        structure = _fast_parse_cif_text(row["cif"], source=f"{self.csv_path}:{material_id}")
+        item = _crystal_to_item(
+            structure,
+            material_id=material_id,
+            target_value=float(row[self.target]),
+            max_atomic_number=self.max_atomic_number,
+            properties={
+                "formation_energy_per_atom": torch.tensor(
+                    float(row["formation_energy_per_atom"]), dtype=torch.float32
+                ),
+                "band_gap": torch.tensor(float(row["band_gap"]), dtype=torch.float32),
+                "e_above_hull": torch.tensor(float(row["e_above_hull"]), dtype=torch.float32),
+            },
+        )
+        if self._item_cache is not None:
+            self._item_cache[idx] = item
+        return item
 
 
 def collate_crystal_batch(items: Iterable[dict[str, object]]) -> CrystalBatch:

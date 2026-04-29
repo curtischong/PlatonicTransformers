@@ -13,6 +13,7 @@ from platonic_transformers.models.platoformer.conv import PlatonicConv
 from platonic_transformers.models.platoformer.groups import PLATONIC_GROUPS
 from platonic_transformers.models.platoformer.lattice import minimum_image_displacement
 from platonic_transformers.models.platoformer.platoformer import PlatonicTransformer
+from platonic_transformers.models.platoformer.rope import PlatonicRoPE
 
 
 @pytest.fixture(autouse=True)
@@ -108,6 +109,29 @@ def test_reciprocal_lattice_frequencies_have_integer_2pi_periods():
         phase_for_cell_vector = torch.einsum("d,hfd->hf", lattice[0, axis], freqs[0])
         expected = 2.0 * math.pi * modes[..., axis]
         assert torch.allclose(phase_for_cell_vector, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_strict_periodic_rope_wraps_integer_fractional_shifts_in_bf16():
+    rope = PlatonicRoPE(
+        embed_dim=8,
+        num_heads=1,
+        solid_name="trivial_3",
+        head_dim=8,
+        spatial_dims=3,
+        freq_sigma=1.0,
+        learned_freqs=False,
+    )
+    x = torch.randn(2, 1, 1, 8).to(torch.bfloat16)
+    frac = torch.tensor(
+        [[0.125, 0.375, 0.625], [0.9, 0.1, 0.7]],
+        dtype=torch.float32,
+    )
+    shifted = frac + torch.tensor([1.0, -2.0, 3.0])
+
+    out = rope.forward_periodic(x, frac)
+    out_shifted = rope.forward_periodic(x, shifted)
+
+    assert torch.allclose(out, out_shifted, atol=1e-3, rtol=1e-3)
 
 
 def test_graph_platoformer_is_invariant_to_integer_cell_shifts():

@@ -1,6 +1,7 @@
 import math
 import os
 import sys
+import csv
 
 import pytest
 import torch
@@ -12,7 +13,11 @@ if REPO_ROOT not in sys.path:
 pymatgen = pytest.importorskip("pymatgen")
 from pymatgen.core import Lattice, Structure
 
-from platonic_transformers.datasets.mp20 import MP20CIFDataset, collate_crystal_batch
+from platonic_transformers.datasets.mp20 import (
+    MP20CIFDataset,
+    MP20CSVRegressionDataset,
+    collate_crystal_batch,
+)
 
 
 def test_mp20_cif_dataset_reads_lattice_and_periodic_batch(tmp_path):
@@ -39,3 +44,37 @@ def test_mp20_cif_dataset_reads_lattice_and_periodic_batch(tmp_path):
     assert batch.pbc.shape == (2, 3)
     assert batch.batch.tolist() == [0, 0, 1, 1]
     assert batch.material_ids == ["mp-test", "mp-test"]
+
+
+def test_mp20_csv_dataset_reads_real_targets_and_cif_strings(tmp_path):
+    structure = Structure(
+        Lattice.cubic(3.0),
+        ["Li", "O"],
+        [[0.0, 0.0, 0.0], [0.5, 0.5, 0.5]],
+    )
+    csv_path = tmp_path / "train.csv"
+    cif = structure.to(fmt="cif")
+    with open(csv_path, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow([
+            "",
+            "material_id",
+            "formation_energy_per_atom",
+            "band_gap",
+            "pretty_formula",
+            "e_above_hull",
+            "elements",
+            "cif",
+            "spacegroup.number",
+        ])
+        writer.writerow([0, "mp-test", -1.25, 2.5, "LiO", 0.01, "['Li', 'O']", cif, 1])
+
+    dataset = MP20CSVRegressionDataset(csv_path)
+    assert len(dataset) == 1
+    assert dataset.targets == [-1.25]
+
+    item = dataset[0]
+    assert item["material_id"] == "mp-test"
+    assert item["x"].shape == (2, 118)
+    assert torch.allclose(item["y"], torch.tensor([-1.25]))
+    assert torch.allclose(item["band_gap"], torch.tensor(2.5))
