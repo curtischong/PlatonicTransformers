@@ -79,7 +79,13 @@ def check_integer_translation_invariance(device: torch.device, modes: torch.Tens
     # The RoPE input is arbitrary pair features. Only the fractional
     # displacement phases should decide whether the rotations agree.
     x = torch.randn(*frac_disp.shape[:-1], 2 * modes.shape[0], device=device)
+
+    # phase_err checks only the periodic position signal. If the integer-cell
+    # shift is handled correctly, the wrapped fractional phases are unchanged.
     phase_err = (wrapped_phase(frac_disp, modes) - wrapped_phase(shifted_frac_disp, modes)).abs().max().item()
+
+    # rope_err checks the end-to-end effect on features. It should be small if
+    # the unchanged wrapped phases lead to identical RoPE feature rotations.
     rope_err = (periodic_rope(x, frac_disp, modes) - periodic_rope(x, shifted_frac_disp, modes)).abs().max().item()
 
     print(f"cart->frac roundtrip error: {roundtrip_err:.3e}")
