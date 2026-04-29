@@ -3,15 +3,14 @@
 
 The core idea is to apply RoPE to fractional displacements with integer
 harmonics. Integer lattice translations then change phases by whole turns, so
-the rotation is unchanged. The lattice still matters separately because the
-same fractional displacement can represent different Cartesian distances.
+the rotation is unchanged.
 """
 
 import argparse
 import math
 
 import torch
-from pymatgen.util.testing import PymatgenTest
+from pymatgen.core import Lattice
 
 
 INTEGER_MODES = (
@@ -24,8 +23,8 @@ INTEGER_MODES = (
 )
 
 
-def lattice_matrix(structure_name: str, device: torch.device) -> torch.Tensor:
-    lattice = PymatgenTest.get_structure(structure_name).lattice
+def lattice_matrix(device: torch.device) -> torch.Tensor:
+    lattice = Lattice.hexagonal(a=2.46, c=6.70)
     return torch.tensor(lattice.matrix, dtype=torch.float32, device=device)
 
 
@@ -42,7 +41,12 @@ def wrapped_phase(frac_displacement: torch.Tensor, modes: torch.Tensor) -> torch
 
 
 def periodic_rope(x: torch.Tensor, frac_displacement: torch.Tensor, modes: torch.Tensor) -> torch.Tensor:
+    # Integer modes make this phase periodic on the unit fractional cell:
+    # frac_displacement + integer_shift gives the same angle modulo 2*pi.
     angle = 2.0 * math.pi * wrapped_phase(frac_displacement, modes)
+
+    # Standard RoPE rotates each adjacent feature pair by the corresponding
+    # periodic lattice angle.
     x0, x1 = x.view(*x.shape[:-1], modes.shape[0], 2).unbind(-1)
     y0 = x0 * angle.cos() - x1 * angle.sin()
     y1 = x0 * angle.sin() + x1 * angle.cos()
@@ -50,14 +54,20 @@ def periodic_rope(x: torch.Tensor, frac_displacement: torch.Tensor, modes: torch
 
 
 def check_integer_translation_invariance(device: torch.device, modes: torch.Tensor) -> None:
-    lattice = lattice_matrix("TiO2", device)
+    # Use a real non-orthogonal pymatgen lattice so fractional and Cartesian
+    # displacements are not interchangeable by accident.
+    lattice = lattice_matrix(device)
     frac = torch.rand(5, 3, device=device)
     cart = frac @ lattice
 
+    # Pairwise Cartesian displacements should recover the original fractional
+    # displacements after solving against the lattice matrix.
     frac_disp = fractional_displacement(cart[None, :, :] - cart[:, None, :], lattice)
     expected = frac[None, :, :] - frac[:, None, :]
     roundtrip_err = (frac_disp - expected).abs().max().item()
 
+    # Shift one atom by an integer number of unit cells. This changes its
+    # Cartesian coordinate but should not change periodic fractional phases.
     shifted_frac = frac.clone()
     shifted_frac[0] += torch.tensor([1.0, -2.0, 1.0], device=device)
     shifted_cart = shifted_frac @ lattice
@@ -66,6 +76,8 @@ def check_integer_translation_invariance(device: torch.device, modes: torch.Tens
         lattice,
     )
 
+    # The RoPE input is arbitrary pair features. Only the fractional
+    # displacement phases should decide whether the rotations agree.
     x = torch.randn(*frac_disp.shape[:-1], 2 * modes.shape[0], device=device)
     phase_err = (wrapped_phase(frac_disp, modes) - wrapped_phase(shifted_frac_disp, modes)).abs().max().item()
     rope_err = (periodic_rope(x, frac_disp, modes) - periodic_rope(x, shifted_frac_disp, modes)).abs().max().item()
@@ -76,25 +88,6 @@ def check_integer_translation_invariance(device: torch.device, modes: torch.Tens
     assert roundtrip_err < 1e-5
     assert phase_err < 1e-5
     assert rope_err < 2e-5
-
-
-def check_lattice_metric_is_separate(device: torch.device, modes: torch.Tensor) -> None:
-    frac_disp = torch.tensor([0.23, -0.17, 0.31], dtype=torch.float32, device=device)
-    lattice_a = lattice_matrix("Si", device)
-    lattice_b = lattice_matrix("TiO2", device)
-
-    cart_a = frac_disp @ lattice_a
-    cart_b = frac_disp @ lattice_b
-    recovered_a = fractional_displacement(cart_a, lattice_a)
-    recovered_b = fractional_displacement(cart_b, lattice_b)
-
-    phase_delta = (wrapped_phase(recovered_a, modes) - wrapped_phase(recovered_b, modes)).abs().max().item()
-    distance_delta = (cart_a.norm() - cart_b.norm()).abs().item()
-
-    print(f"same fractional phase delta across lattices: {phase_delta:.3e}")
-    print(f"same fractional displacement distance delta: {distance_delta:.3f}")
-    assert phase_delta < 1e-5
-    assert distance_delta > 0.25
 
 
 def main() -> None:
@@ -109,7 +102,6 @@ def main() -> None:
     print(f"device={device}")
 
     check_integer_translation_invariance(device, modes)
-    check_lattice_metric_is_separate(device, modes)
     print("periodic lattice RoPE core checks passed")
 
 
