@@ -4,8 +4,7 @@
 This script does not import PlatonicTransformer and does not train a model. It
 only checks the algebra needed by a lattice-aware periodic RoPE layer:
 
-1. Cartesian coordinates are produced by ``cart = frac @ lattice`` for skewed
-   row-vector cells.
+1. Cartesian coordinates are produced by pymatgen for skewed row-vector cells.
 2. Cartesian pair displacements can be solved back to fractional displacements.
 3. Integer cell translations leave modulo-one RoPE rotations unchanged.
 4. The same fractional coordinates can have different metric distances under
@@ -18,26 +17,38 @@ from __future__ import annotations
 import argparse
 import math
 
+import numpy as np
 import torch
+from pymatgen.core import Lattice
 
 
 def make_triclinic_lattice(batch_size: int, device: torch.device) -> torch.Tensor:
-    """Create non-orthogonal row-vector cell matrices with positive volume."""
-    lengths = 1.6 + 2.4 * torch.rand(batch_size, 3, device=device)
-    shear = -0.45 + 0.9 * torch.rand(batch_size, 3, device=device)
-
-    lattice = torch.zeros(batch_size, 3, 3, device=device)
-    lattice[:, 0, 0] = lengths[:, 0]
-    lattice[:, 1, 0] = shear[:, 0] * lengths[:, 1]
-    lattice[:, 1, 1] = lengths[:, 1] * torch.sqrt(1.0 - shear[:, 0].square()).clamp_min(0.35)
-    lattice[:, 2, 0] = shear[:, 1] * lengths[:, 2]
-    lattice[:, 2, 1] = shear[:, 2] * lengths[:, 2]
-    lattice[:, 2, 2] = lengths[:, 2] * 0.75
-    return lattice
+    """Create non-orthogonal row-vector cell matrices with pymatgen."""
+    lengths = 1.6 + 2.4 * torch.rand(batch_size, 3)
+    angles = 62.0 + 48.0 * torch.rand(batch_size, 3)
+    matrices = np.stack([
+        Lattice.from_parameters(
+            lengths[i, 0].item(),
+            lengths[i, 1].item(),
+            lengths[i, 2].item(),
+            angles[i, 0].item(),
+            angles[i, 1].item(),
+            angles[i, 2].item(),
+        ).matrix
+        for i in range(batch_size)
+    ])
+    return torch.tensor(matrices, dtype=torch.float32, device=device)
 
 
 def frac_to_cart(frac: torch.Tensor, lattice: torch.Tensor) -> torch.Tensor:
-    return torch.einsum("bnd,bdc->bnc", frac, lattice)
+    """Convert fractional coordinates with pymatgen's lattice convention."""
+    frac_np = frac.detach().cpu().numpy()
+    lattice_np = lattice.detach().cpu().numpy()
+    cart = np.stack([
+        Lattice(lattice_np[i]).get_cartesian_coords(frac_np[i])
+        for i in range(frac_np.shape[0])
+    ])
+    return torch.tensor(cart, dtype=frac.dtype, device=frac.device)
 
 
 def fractional_displacement(displacement: torch.Tensor, lattice: torch.Tensor) -> torch.Tensor:
@@ -50,31 +61,39 @@ def fractional_displacement(displacement: torch.Tensor, lattice: torch.Tensor) -
 
 def lattice_features(lattice: torch.Tensor) -> torch.Tensor:
     """Rotation-invariant lattice parameters a scalar network can consume."""
-    lengths = torch.linalg.norm(lattice, dim=-1).clamp_min(1e-8)
-    cos_alpha = (lattice[:, 1] * lattice[:, 2]).sum(-1) / (lengths[:, 1] * lengths[:, 2])
-    cos_beta = (lattice[:, 0] * lattice[:, 2]).sum(-1) / (lengths[:, 0] * lengths[:, 2])
-    cos_gamma = (lattice[:, 0] * lattice[:, 1]).sum(-1) / (lengths[:, 0] * lengths[:, 1])
-    volume = torch.linalg.det(lattice).abs().clamp_min(1e-8)
-    return torch.stack(
-        [lengths[:, 0], lengths[:, 1], lengths[:, 2], cos_alpha, cos_beta, cos_gamma, torch.log(volume)],
-        dim=-1,
-    )
+    lattice_np = lattice.detach().cpu().numpy()
+    features = []
+    for cell in lattice_np:
+        pmg_lattice = Lattice(cell)
+        alpha, beta, gamma = pmg_lattice.angles
+        features.append([
+            *pmg_lattice.lengths,
+            math.cos(math.radians(alpha)),
+            math.cos(math.radians(beta)),
+            math.cos(math.radians(gamma)),
+            math.log(max(pmg_lattice.volume, 1e-8)),
+        ])
+    return torch.tensor(features, dtype=lattice.dtype, device=lattice.device)
 
 
 def make_modes(num_heads: int, num_pairs: int, device: torch.device) -> torch.Tensor:
-    candidates = []
-    radius = 1
-    while len(candidates) < num_heads * num_pairs:
-        shell = []
-        for i in range(-radius, radius + 1):
-            for j in range(-radius, radius + 1):
-                for k in range(-radius, radius + 1):
-                    if (i, j, k) != (0, 0, 0) and max(abs(i), abs(j), abs(k)) == radius:
-                        shell.append((i, j, k))
-        shell.sort(key=lambda v: (sum(x * x for x in v), sum(abs(x) for x in v), v))
-        candidates.extend(shell)
-        radius += 1
-    return torch.tensor(candidates[: num_heads * num_pairs], dtype=torch.float32, device=device).view(
+    """Use pymatgen's unit reciprocal lattice to choose integer harmonics."""
+    total = num_heads * num_pairs
+    reciprocal = Lattice.cubic(1.0).reciprocal_lattice_crystallographic
+    modes: dict[tuple[int, int, int], float] = {}
+    radius = 1.01
+    while len(modes) < total:
+        for _, distance, _, image in reciprocal.get_points_in_sphere([[0, 0, 0]], [0, 0, 0], radius):
+            mode = tuple(int(round(x)) for x in image)
+            if mode != (0, 0, 0):
+                modes[mode] = float(distance)
+        radius += 1.0
+
+    sorted_modes = sorted(
+        modes,
+        key=lambda mode: (modes[mode], sum(abs(x) for x in mode), mode),
+    )
+    return torch.tensor(sorted_modes[:total], dtype=torch.float32, device=device).view(
         num_heads,
         num_pairs,
         3,
@@ -100,22 +119,15 @@ def apply_periodic_rope(x: torch.Tensor, frac: torch.Tensor, modes: torch.Tensor
     return torch.stack([y0, y1], dim=-1).view(*leading, num_heads, head_dim)
 
 
-def brute_force_periodic_distances(frac: torch.Tensor, lattice: torch.Tensor) -> torch.Tensor:
-    """True nearest-image distances by enumerating neighboring cells.
-
-    Component-wise rounding in fractional coordinates is not generally the
-    shortest image for skewed cells, so this explicitly checks the 27 closest
-    cell translations.
-    """
-    shifts = torch.tensor(
-        [(i, j, k) for i in (-1, 0, 1) for j in (-1, 0, 1) for k in (-1, 0, 1)],
-        dtype=frac.dtype,
-        device=frac.device,
-    )
-    delta = frac[:, :, None, :] - frac[:, None, :, :]
-    images = delta[:, :, :, None, :] + shifts
-    cart_images = torch.einsum("bijnc,bdc->bijnd", images, lattice)
-    return torch.linalg.norm(cart_images, dim=-1).amin(dim=-1)
+def pymatgen_periodic_distances(frac: torch.Tensor, lattice: torch.Tensor) -> torch.Tensor:
+    """Periodic pair distances from pymatgen, including skew-cell images."""
+    frac_np = frac.detach().cpu().numpy()
+    lattice_np = lattice.detach().cpu().numpy()
+    distances = np.stack([
+        Lattice(lattice_np[i]).get_all_distances(frac_np[i], frac_np[i])
+        for i in range(frac_np.shape[0])
+    ])
+    return torch.tensor(distances, dtype=frac.dtype, device=frac.device)
 
 
 def check_triclinic_roundtrip(batch_size: int, num_atoms: int, device: torch.device) -> None:
@@ -181,8 +193,8 @@ def check_lattice_parameters_are_needed(batch_size: int, num_atoms: int, device:
     )
     phase_delta = (wrapped_phase(frac_disp_a, modes) - wrapped_phase(frac_disp_b, modes)).abs().max().item()
 
-    dist_a = brute_force_periodic_distances(frac, lattice_a)
-    dist_b = brute_force_periodic_distances(frac, lattice_b)
+    dist_a = pymatgen_periodic_distances(frac, lattice_a)
+    dist_b = pymatgen_periodic_distances(frac, lattice_b)
     distance_delta = (dist_a - dist_b).abs().mean().item()
     feature_delta = (lattice_features(lattice_a) - lattice_features(lattice_b)).abs().mean().item()
     target_a = torch.exp(-dist_a).mean(dim=(1, 2))
