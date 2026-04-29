@@ -19,6 +19,7 @@ timm
 fairchem-core
 ase-db-backends
 mendeleev
+pymatgen
 scikit-learn
 rdkit
 posebusters  # QM9 generation: physical sanity checks on generated molecules

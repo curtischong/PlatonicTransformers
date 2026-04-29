@@ -155,7 +155,9 @@ class PlatonicTransformer(nn.Module):
                 batch: Optional[torch.Tensor] = None,
                 mask: Optional[Tensor] = None,
                 vec: Optional[Tensor] = None,
-                avg_num_nodes: float = 1.0) -> Tensor:
+                avg_num_nodes: float = 1.0,
+                lattice: Optional[Tensor] = None,
+                pbc: Optional[Tensor] = None) -> Tensor:
         """
         Forward pass for the Platonic Transformer.
 
@@ -190,7 +192,9 @@ class PlatonicTransformer(nn.Module):
                 pos=pos,
                 batch=batch,
                 mask=mask,
-                avg_num_nodes=avg_num_nodes
+                avg_num_nodes=avg_num_nodes,
+                lattice=lattice,
+                pbc=pbc,
             )
 
         # 4. Post-pooling readout

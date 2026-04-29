@@ -37,6 +37,7 @@ dependencies = [
     "fairchem-core",
     "ase-db-backends",
     "mendeleev",
+    "pymatgen",
     "scikit-learn",
     "rdkit",
 

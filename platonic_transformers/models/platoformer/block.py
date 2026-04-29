@@ -190,7 +190,9 @@ class PlatonicBlock(nn.Module):
         pos: Tensor,
         batch: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
-        avg_num_nodes = 1.0
+        avg_num_nodes = 1.0,
+        lattice: Optional[Tensor] = None,
+        pbc: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Args:
@@ -203,7 +205,15 @@ class PlatonicBlock(nn.Module):
         """
         # Interaction Block (pre-normalization is always used)
         normed_x = self._normalize(x, self.norm1)
-        interaction_out = self._interaction_block(normed_x, pos, batch, mask, avg_num_nodes)
+        interaction_out = self._interaction_block(
+            normed_x,
+            pos,
+            batch,
+            mask,
+            avg_num_nodes,
+            lattice=lattice,
+            pbc=pbc,
+        )
         if self.gamma_1 is not None:
             interaction_out = self._apply_layer_scale(interaction_out, self.gamma_1)
         x = x + self.drop_path1(interaction_out)
@@ -235,10 +245,25 @@ class PlatonicBlock(nn.Module):
         return normed_reshaped.view(*leading_dims, -1)
 
     def _interaction_block(
-        self, x: Tensor, pos: Tensor, batch: Optional[Tensor], mask: Optional[Tensor], avg_num_nodes = 1.0
+        self,
+        x: Tensor,
+        pos: Tensor,
+        batch: Optional[Tensor],
+        mask: Optional[Tensor],
+        avg_num_nodes = 1.0,
+        lattice: Optional[Tensor] = None,
+        pbc: Optional[Tensor] = None,
     ) -> Tensor:
         """Wrapper for the PlatonicConv layer."""
-        interaction_output = self.interaction(x, pos, batch=batch, mask=mask, avg_num_nodes=avg_num_nodes)
+        interaction_output = self.interaction(
+            x,
+            pos,
+            batch=batch,
+            mask=mask,
+            avg_num_nodes=avg_num_nodes,
+            lattice=lattice,
+            pbc=pbc,
+        )
         return self.dropout1(interaction_output)
 
     def _ff_block(self, x: Tensor) -> Tensor:

@@ -47,6 +47,11 @@ from platonic_transformers.models.platoformer.utils import scatter_add
 from platonic_transformers.models.platoformer.rope import PlatonicRoPE
 from platonic_transformers.models.platoformer.linear import PlatonicLinear
 from platonic_transformers.models.platoformer.groups import PLATONIC_GROUPS
+from platonic_transformers.models.platoformer.lattice import (
+    canonicalize_lattice,
+    canonicalize_pbc,
+    minimum_image_displacement,
+)
 
 
 class PlatonicConv(nn.Module):
@@ -148,8 +153,8 @@ class PlatonicConv(nn.Module):
         # Final equivariant linear layer
         self.out_proj = PlatonicLinear(embed_dim, out_channels, solid_name, bias=bias)
     
-    def _forward_shared(self, x: Tensor, pos: Tensor):
-        """Shared logic for projections and RoPE application."""
+    def _project_qkv(self, x: Tensor):
+        """Project inputs to grouped multi-head query, key, and value tensors."""
         leading_dims = x.shape[:-1]
         
         q_raw = self.q_proj(x)
@@ -161,6 +166,12 @@ class PlatonicConv(nn.Module):
         q = q_raw.view(*leading_dims, self.num_G, self.effective_num_heads, self.head_dim)
         v = v_raw.view(*leading_dims, self.num_G, self.effective_num_heads, self.head_dim)
         k = k_raw.view(*leading_dims, self.num_G, self.effective_num_heads, self.head_dim)
+
+        return q, k, v
+
+    def _forward_shared(self, x: Tensor, pos: Tensor):
+        """Shared logic for projections and absolute-position RoPE application."""
+        q, k, v = self._project_qkv(x)
 
         # Apply RoPE to query and key (and optionally value, per GTA Eq. 5)
         if self.rope_emb is not None:
@@ -178,7 +189,9 @@ class PlatonicConv(nn.Module):
         batch: torch.Tensor,  # [N]
         pos: Optional[torch.Tensor] = None,
         edge_index: Optional[torch.Tensor] = None,
-        k_knn: Optional[int] = None
+        k_knn: Optional[int] = None,
+        lattice: Optional[torch.Tensor] = None,
+        pbc: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute fully connected edges if edge_index is None, or kNN edges if k_knn is given.
@@ -222,6 +235,26 @@ class PlatonicConv(nn.Module):
         q_src = q.reshape(N, GH, D)[src]  # [E, GH, D]
         k_dst = k.reshape(N, GH, D)[dst]  # [E, GH, D]
         v_dst = v.reshape(N, GH, D)[dst]  # [E, GH, D]
+
+        if lattice is not None:
+            if pos is None:
+                raise ValueError("pos must be provided when lattice/PBC attention is used.")
+            if self.rope_emb is not None:
+                displacement = pos[dst] - pos[src]
+                displacement = minimum_image_displacement(
+                    displacement,
+                    lattice[batch[src]],
+                    pbc[batch[src]] if pbc is not None else None,
+                )
+                k_dst = self.rope_emb(
+                    k_dst.view(E, G, H, D),
+                    displacement,
+                ).reshape(E, GH, D)
+                if self.rope_on_values:
+                    v_dst = self.rope_emb(
+                        v_dst.view(E, G, H, D),
+                        displacement,
+                    ).reshape(E, GH, D)
 
         scores = (q_src * k_dst).sum(-1) * D ** -0.5  # [E, GH]
 
@@ -316,11 +349,41 @@ class PlatonicConv(nn.Module):
         out = out_bf.to(orig_dtype)
         return out.reshape(N, GH * D)
 
-    def _forward_graph(self, x: Tensor, pos: Tensor, batch: Tensor, avg_num_nodes=1.0):
+    def _forward_graph(
+        self,
+        x: Tensor,
+        pos: Tensor,
+        batch: Tensor,
+        avg_num_nodes=1.0,
+        lattice: Optional[Tensor] = None,
+        pbc: Optional[Tensor] = None,
+    ):
         """
         Implementation for graph-structured data.
         Supports both kernelized linear attention and standard softmax attention.
         """
+        num_graphs = int(batch.max().item()) + 1
+        lattice = canonicalize_lattice(lattice, num_graphs, pos.device, pos.dtype)
+        if lattice is not None:
+            pbc = canonicalize_pbc(pbc, num_graphs, pos.shape[-1], pos.device)
+            if not self.attention:
+                raise ValueError(
+                    "lattice/PBC support requires attention=True. The linear "
+                    "attention path factorizes over nodes and cannot represent "
+                    "pair-specific minimum-image displacements."
+                )
+            q_raw, k_raw, v = self._project_qkv(x)
+            output = self.graph_scattered_attention(
+                q_raw,
+                k_raw,
+                v,
+                batch,
+                pos=pos,
+                lattice=lattice,
+                pbc=pbc,
+            )
+            return self.out_proj(output)
+
         q_rope, k_rope, v = self._forward_shared(x, pos) # [N, G, H, D_h]
 
         if self.attention:
@@ -352,13 +415,61 @@ class PlatonicConv(nn.Module):
 
         return self.out_proj(output)
 
-    def _forward_dense(self, x: Tensor, pos: Tensor, mask: Tensor, avg_num_nodes=1.0):
+    def _forward_dense(
+        self,
+        x: Tensor,
+        pos: Tensor,
+        mask: Tensor,
+        avg_num_nodes=1.0,
+        lattice: Optional[Tensor] = None,
+        pbc: Optional[Tensor] = None,
+    ):
         """
         Implementation for dense, padded data.
         Supports both linear and standard softmax attention.
         """
-        q_rope, k_rope, v = self._forward_shared(x, pos)
         B, S, _ = x.shape # B: batch size, S: sequence length
+        lattice = canonicalize_lattice(lattice, B, pos.device, pos.dtype)
+        if lattice is not None:
+            pbc = canonicalize_pbc(pbc, B, pos.shape[-1], pos.device)
+            if not self.attention:
+                raise ValueError(
+                    "lattice/PBC support requires attention=True. The linear "
+                    "attention path factorizes over nodes and cannot represent "
+                    "pair-specific minimum-image displacements."
+                )
+
+            q, k, v = self._project_qkv(x)
+            if self.rope_emb is not None:
+                displacement = pos[:, None, :, :] - pos[:, :, None, :]
+                displacement = minimum_image_displacement(
+                    displacement,
+                    lattice[:, None, None, :, :],
+                    pbc[:, None, None, :],
+                )
+                k = k[:, None, :, :, :, :].expand(B, S, S, self.num_G, self.effective_num_heads, self.head_dim)
+                k = self.rope_emb(k.contiguous(), displacement)
+                if self.rope_on_values:
+                    v = v[:, None, :, :, :, :].expand(B, S, S, self.num_G, self.effective_num_heads, self.head_dim)
+                    v = self.rope_emb(v.contiguous(), displacement)
+                else:
+                    v = v[:, None, :, :, :, :].expand(B, S, S, self.num_G, self.effective_num_heads, self.head_dim)
+            else:
+                k = k[:, None, :, :, :, :].expand(B, S, S, self.num_G, self.effective_num_heads, self.head_dim)
+                v = v[:, None, :, :, :, :].expand(B, S, S, self.num_G, self.effective_num_heads, self.head_dim)
+
+            scores = (q[:, :, None, :, :, :] * k).sum(-1) * self.head_dim ** -0.5
+            if mask is not None:
+                key_mask = mask[:, None, :, None, None]
+                scores = scores.masked_fill(~key_mask, torch.finfo(scores.dtype).min)
+            weights = torch.softmax(scores, dim=2)
+            if mask is not None:
+                weights = weights * mask[:, None, :, None, None]
+            output = torch.sum(weights.unsqueeze(-1) * v, dim=2)
+            output = output.reshape(B, S, self.embed_dim)
+            return self.out_proj(output)
+
+        q_rope, k_rope, v = self._forward_shared(x, pos)
 
         if self.attention:
             # Reshape for scaled_dot_product_attention: (B, S, G, H, Dh) -> (B, G*H, S, Dh)
@@ -401,7 +512,9 @@ class PlatonicConv(nn.Module):
         pos: Tensor,
         batch: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
-        avg_num_nodes: Optional[float] = 1.0
+        avg_num_nodes: Optional[float] = 1.0,
+        lattice: Optional[Tensor] = None,
+        pbc: Optional[Tensor] = None,
     ) -> Tensor:
         is_graph_mode = batch is not None
         avg_num_nodes = avg_num_nodes if avg_num_nodes is not None else 1.0
@@ -409,6 +522,20 @@ class PlatonicConv(nn.Module):
         if is_graph_mode:
             if mask is not None:
                 raise ValueError("Only one of 'batch' or 'mask' can be provided.")
-            return self._forward_graph(x, pos, batch, avg_num_nodes=avg_num_nodes)
+            return self._forward_graph(
+                x,
+                pos,
+                batch,
+                avg_num_nodes=avg_num_nodes,
+                lattice=lattice,
+                pbc=pbc,
+            )
         else:
-            return self._forward_dense(x, pos, mask, avg_num_nodes=avg_num_nodes)
+            return self._forward_dense(
+                x,
+                pos,
+                mask,
+                avg_num_nodes=avg_num_nodes,
+                lattice=lattice,
+                pbc=pbc,
+            )
