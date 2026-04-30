@@ -19,6 +19,7 @@ model:
   solid_name: "octahedron"  # Options: tetrahedron, trivial_3, octahedron, icosahedron
   spatial_dim: 3
   dense_mode: false
+  fractional_pos: false              # Set true when graph.pos contains fractional coordinates and graph.cell/lattice is present.
   
   # Task configuration
   scalar_task_level: "graph"
@@ -107,4 +108,3 @@ checkpoint:
   monitor: "valid MAE"
   mode: "min"
   save_last: true
-

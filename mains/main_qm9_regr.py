@@ -157,8 +157,22 @@ class QM9Model(pl.LightningModule):
         positions = positions - positions_mean[graph.batch]  # Center positions per graph
         batch_idx = graph.batch  # [N]
 
-        # PlatonicTransformer expects x, pos, batch
-        pred, _ = self.net(node_features, positions, batch_idx, vec=None, avg_num_nodes=self.avg_num_nodes)
+        lattice = getattr(graph, "lattice", None)
+        if lattice is None:
+            lattice = getattr(graph, "cell", None)
+        fractional_pos = self.config.model.get("fractional_pos", False)
+
+        # PlatonicTransformer expects x, pos, batch. If fractional_pos is set,
+        # positions are interpreted as fractional coordinates against lattice.
+        pred, _ = self.net(
+            node_features,
+            positions,
+            batch_idx,
+            vec=None,
+            lattice=lattice,
+            fractional_pos=fractional_pos,
+            avg_num_nodes=self.avg_num_nodes,
+        )
 
         return pred.squeeze(-1)  # Assuming output_dim is 1
     

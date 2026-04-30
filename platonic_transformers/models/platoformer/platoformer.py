@@ -9,6 +9,7 @@ from platonic_transformers.models.platoformer.groups import PLATONIC_GROUPS
 from platonic_transformers.models.platoformer.linear import PlatonicLinear
 from platonic_transformers.models.platoformer.io import to_dense_and_mask, pool, lift, to_scalars_vectors
 from platonic_transformers.models.platoformer.ape import PlatonicAPE as APE
+from platonic_transformers.models.platoformer.lattice import fractional_to_cartesian
 
 
 class PlatonicTransformer(nn.Module):
@@ -155,15 +156,25 @@ class PlatonicTransformer(nn.Module):
                 batch: Optional[torch.Tensor] = None,
                 mask: Optional[Tensor] = None,
                 vec: Optional[Tensor] = None,
-                avg_num_nodes: float = 1.0) -> Tensor:
+                avg_num_nodes: float = 1.0,
+                lattice: Optional[Tensor] = None,
+                fractional_pos: bool = False) -> Tensor:
         """
         Forward pass for the Platonic Transformer.
 
         Args:
             x (Tensor): Input node features of shape (N, input_dim).
-            pos (Tensor): Node positions of shape (N, spatial_dims).
+            pos (Tensor): Node positions of shape (N, spatial_dims). These are
+                Cartesian by default. Set ``fractional_pos=True`` and pass
+                ``lattice`` to supply fractional coordinates instead.
             batch (Tensor): Batch index for each node of shape (N,).
             mask (Tensor, optional): Attention mask of shape (B, N) or (N, N) for dense inputs.
+            lattice (Tensor, optional): Lattice/cell matrices with row-vector
+                convention ``cart = fractional @ lattice``. Shape can be
+                (spatial_dims, spatial_dims) for a shared lattice or
+                (B, spatial_dims, spatial_dims) for per-graph lattices.
+            fractional_pos (bool): If True, convert ``pos`` from fractional to
+                Cartesian coordinates before positional embeddings and attention.
         Returns:
             Tensor: Final predictions. Shape is (B, output_dim) for graph tasks
                     or (N, output_dim) for node tasks.
@@ -177,6 +188,9 @@ class PlatonicTransformer(nn.Module):
         else:
             self._input_was_dense_format = False
             mask = None
+
+        if fractional_pos:
+            pos = fractional_to_cartesian(pos, lattice, batch=batch)
 
         # 2. Lift scalars and vectors, then embed
         x = lift(x, vec, self.group)
