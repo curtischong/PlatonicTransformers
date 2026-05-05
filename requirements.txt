@@ -22,6 +22,7 @@ mendeleev
 scikit-learn
 rdkit
 posebusters  # QM9 generation: physical sanity checks on generated molecules
+h5py  # ScanObjectNN dataset h5 files
 
 # -- GPU Acceleration (optional, graceful fallback if unavailable) --
 nvidia-dali-cuda120  # GPU-fused data loading for ImageNet
