@@ -244,7 +244,7 @@ class SamplePoints(BaseTransform):
 class NormalizeCoord(BaseTransform):
     """Normalize point-cloud coordinates by centering and scaling."""
 
-    def __call__(self, data: Data) -> Data:
+    def forward(self, data: Data) -> Data:
         centroid = torch.mean(data.pos, dim=0)
         data.pos = data.pos - centroid
 
@@ -263,7 +263,7 @@ class RandomJitter(BaseTransform):
         self.clip = clip
         self.relative = relative
 
-    def __call__(self, data: Data) -> Data:
+    def forward(self, data: Data) -> Data:
         if self.relative:
             scale = torch.std(torch.norm(data.pos, dim=1))
             sigma = self.sigma * scale
@@ -282,7 +282,7 @@ class RandomShift(BaseTransform):
     def __init__(self, shift_range: float = 0.1) -> None:
         self.shift_range = shift_range
 
-    def __call__(self, data: Data) -> Data:
+    def forward(self, data: Data) -> Data:
         shift = torch.rand(3, device=data.pos.device) * 2 * self.shift_range - self.shift_range
         data.pos = data.pos + shift
         return data
@@ -295,7 +295,7 @@ class RandomRotatePerturbation(BaseTransform):
         self.angle_sigma = angle_sigma
         self.angle_clip = angle_clip
 
-    def __call__(self, data: Data) -> Data:
+    def forward(self, data: Data) -> Data:
         angles = torch.clamp(
             self.angle_sigma * torch.randn(3, device=data.pos.device),
             min=-self.angle_clip,

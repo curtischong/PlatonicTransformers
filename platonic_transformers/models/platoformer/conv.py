@@ -47,6 +47,7 @@ from platonic_transformers.models.platoformer.utils import scatter_add
 from platonic_transformers.models.platoformer.rope import PlatonicRoPE
 from platonic_transformers.models.platoformer.linear import PlatonicLinear
 from platonic_transformers.models.platoformer.groups import PLATONIC_GROUPS
+from platonic_transformers.models.platoformer.io import lift_vectors
 
 
 class PlatonicConv(nn.Module):
@@ -405,10 +406,94 @@ class PlatonicConv(nn.Module):
     ) -> Tensor:
         is_graph_mode = batch is not None
         avg_num_nodes = avg_num_nodes if avg_num_nodes is not None else 1.0
-        
+
         if is_graph_mode:
             if mask is not None:
                 raise ValueError("Only one of 'batch' or 'mask' can be provided.")
             return self._forward_graph(x, pos, batch, avg_num_nodes=avg_num_nodes)
         else:
             return self._forward_dense(x, pos, mask, avg_num_nodes=avg_num_nodes)
+
+
+class PlatonicEdgeConv(nn.Module):
+    """
+    Group-equivariant EdgeConv-style patchification.
+
+    For each FPS center i and its k nearest dense points j ∈ KNN(i):
+      - compute the relative offset p_j − p_i (a vector)
+      - lift it to G-equivariant features
+      - concat per-G with kv_features[j] (which were embedded upstream)
+      - run a small platonic MLP per (i, j) edge
+      - max-pool over j to produce a single feature per center
+
+    Equivariance: relative offsets transform covariantly under O(3); concat
+    is per-G aligned so PlatonicLinear sees the right structure; max-pool
+    over the k axis commutes with the group action on the G axis.
+
+    Cheaper than cross-attention because there is no Q×K matrix and no
+    softmax — just a per-edge MLP and a pool.
+    """
+    def __init__(
+        self,
+        kv_in_channels: int,    # full lifted dim from upstream x_embedder (= hidden_dim)
+        out_channels: int,
+        embed_dim: int,
+        solid_name: str,
+        spatial_dims: int = 3,
+        bias: bool = True,
+        activation: str = "gelu",
+    ):
+        super().__init__()
+        self.group = PLATONIC_GROUPS[solid_name.lower()]
+        self.num_G = self.group.G
+        self.spatial_dims = spatial_dims
+
+        if kv_in_channels % self.num_G != 0:
+            raise ValueError(f"kv_in_channels ({kv_in_channels}) must be divisible by group size ({self.num_G}).")
+        if embed_dim % self.num_G != 0:
+            raise ValueError(f"embed_dim ({embed_dim}) must be divisible by group size ({self.num_G}).")
+        if out_channels % self.num_G != 0:
+            raise ValueError(f"out_channels ({out_channels}) must be divisible by group size ({self.num_G}).")
+
+        self.kv_per_g = kv_in_channels // self.num_G
+
+        # Lifted offset has G * spatial_dims channels (1 vector channel × G frames × spatial dims).
+        offset_in = self.num_G * spatial_dims
+        combined_in = kv_in_channels + offset_in   # both are in (G * C_per_g) form, see forward
+
+        _act = {"gelu": nn.GELU, "silu": nn.SiLU, "relu": nn.ReLU}.get(activation, nn.GELU)
+        self.edge_mlp = nn.Sequential(
+            PlatonicLinear(combined_in, embed_dim, solid_name, bias=bias),
+            _act(),
+            PlatonicLinear(embed_dim, embed_dim, solid_name, bias=bias),
+        )
+        self.out_proj = PlatonicLinear(embed_dim, out_channels, solid_name, bias=bias)
+
+    def forward(
+        self,
+        q_pos: Tensor,         # [N_q, spatial_dims]
+        kv_x: Tensor,          # [N_kv, kv_in_channels]   (already lifted+embedded)
+        kv_pos: Tensor,        # [N_kv, spatial_dims]
+        knn_indices: Tensor,   # [N_q, k]
+    ) -> Tensor:
+        N_q, k = knn_indices.shape
+        idx_flat = knn_indices.reshape(-1)
+
+        kv_local = kv_x[idx_flat].view(N_q, k, -1)          # [N_q, k, kv_in]   (G * kv_per_g)
+        kv_local_pos = kv_pos[idx_flat].view(N_q, k, 3)
+        rel_offset = kv_local_pos - q_pos.unsqueeze(1)      # [N_q, k, 3]
+
+        # Lift the relative offset as a 1-vector input. Adds a unit "channel"
+        # axis so lift_vectors sees [..., C=1, 3].
+        offset_lifted = lift_vectors(rel_offset.unsqueeze(-2), self.group)   # [N_q, k, G * 3]
+
+        # Concat per-G-element so the result is in the [..., G * C_per_g] format
+        # PlatonicLinear expects.
+        offset_g = offset_lifted.view(N_q, k, self.num_G, self.spatial_dims)
+        kv_g = kv_local.view(N_q, k, self.num_G, self.kv_per_g)
+        combined_g = torch.cat([offset_g, kv_g], dim=-1)    # [N_q, k, G, sp + kv_per_g]
+        combined = combined_g.view(N_q, k, -1)              # [N_q, k, G * (sp + kv_per_g)]
+
+        edge_features = self.edge_mlp(combined)             # [N_q, k, embed]
+        pooled, _ = edge_features.max(dim=1)                # [N_q, embed]
+        return self.out_proj(pooled)

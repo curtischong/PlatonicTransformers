@@ -7,8 +7,10 @@ from typing import Optional
 from platonic_transformers.models.platoformer.block import PlatonicBlock
 from platonic_transformers.models.platoformer.groups import PLATONIC_GROUPS
 from platonic_transformers.models.platoformer.linear import PlatonicLinear
-from platonic_transformers.models.platoformer.io import to_dense_and_mask, pool, lift, to_scalars_vectors
-from platonic_transformers.models.platoformer.ape import PlatonicAPE as APE
+from platonic_transformers.models.platoformer.io import pool, to_scalars_vectors
+from platonic_transformers.models.platoformer.patchifiers import (
+    StandardPatchifier, EdgeConvPatchifier,
+)
 
 
 class PlatonicTransformer(nn.Module):
@@ -53,6 +55,7 @@ class PlatonicTransformer(nn.Module):
         scalar_task_level: str = "graph",
         vector_task_level: str = "node",
         ffn_readout: bool = True,
+        trivial_readout: bool = False,  # symmetry-break: pool group, then standard linears
         # Attention block specification:
         mean_aggregation: bool = False,
         dropout: float = 0.1,
@@ -70,6 +73,14 @@ class PlatonicTransformer(nn.Module):
         rope_on_values: bool = False,
         attention_backend: str = "scatter",  # "scatter" | "flash"
         activation: str = "gelu",
+        # In-model patchification: learnable Platonic EdgeConv (FPS centers
+        # + KNN + per-edge MLP + max-pool). When off, callers are expected
+        # to pre-patchify in the dataloader (StandardPatchifier just lifts +
+        # embeds + adds APE). Ratio for FPS = num_centers / num_points.
+        edge_conv_patchify: bool = False,
+        edge_conv_k: int = 32,
+        fps_ratio: float = 0.0625,          # FPS sampling ratio for in-model patchify.
+        patchifier: Optional[nn.Module] = None,
     ):
         super().__init__()
 
@@ -95,17 +106,35 @@ class PlatonicTransformer(nn.Module):
         self.output_dim = output_dim
         self.output_dim_vec = output_dim_vec
         self.mean_aggregation = mean_aggregation
-
-        # Global position embedding for fixed patching ViTs
-        if ape_sigma is not None:
-            self.ape = APE(hidden_dim, solid_name, ape_sigma, spatial_dim, learned_freqs)
+        self.trivial_readout = trivial_readout
+        # When trivial_readout=True the readout MLPs use the trivial-G group
+        # (PlatonicLinear with G=1 is just a standard nn.Linear), and the
+        # final to_scalars_vectors call reshapes through that trivial group
+        # — i.e. the model breaks equivariance at the head.
+        if trivial_readout:
+            self.readout_group = PLATONIC_GROUPS[f"trivial_{spatial_dim}"]
         else:
-            self.register_buffer('ape', None)
+            self.readout_group = self.group
 
-        # --- Modules ---
-        # 1. Input Embedding: Applied before lifting to the group.
-        # Maps input features to the per-group-element hidden dimension.
-        self.x_embedder = PlatonicLinear((input_dim + input_dim_vec * spatial_dim) * self.num_G, self.hidden_dim, solid_name, bias=False)
+        # Patchifier owns x_embedder, APE, and (for EdgeConv) the learnable
+        # patchify module. Callers can inject a custom patchifier instance via
+        # `patchifier=` (must conform to the interface in patchifiers.py).
+        self.edge_conv_patchify = edge_conv_patchify
+        if patchifier is not None:
+            self.patchifier = patchifier
+        elif edge_conv_patchify:
+            self.patchifier = EdgeConvPatchifier(
+                group=self.group, input_dim=input_dim, input_dim_vec=input_dim_vec,
+                hidden_dim=hidden_dim, spatial_dim=spatial_dim, solid_name=solid_name,
+                ape_sigma=ape_sigma, learned_freqs=learned_freqs,
+                ratio=fps_ratio, k=edge_conv_k, activation=activation,
+            )
+        else:
+            self.patchifier = StandardPatchifier(
+                group=self.group, input_dim=input_dim, input_dim_vec=input_dim_vec,
+                hidden_dim=hidden_dim, spatial_dim=spatial_dim, solid_name=solid_name,
+                ape_sigma=ape_sigma, learned_freqs=learned_freqs, dense_mode=dense_mode,
+            )
 
         # 2. Equivariant Encoder Layers
         # The blocks operate on the total flattened dimension (G * C).
@@ -134,20 +163,22 @@ class PlatonicTransformer(nn.Module):
                 attention_backend=attention_backend,
             ))
 
+        readout_solid = f"trivial_{spatial_dim}" if trivial_readout else solid_name
+        readout_G = 1 if trivial_readout else self.num_G
         if ffn_readout:
             self.scalar_readout = nn.Sequential(
-                PlatonicLinear(self.hidden_dim, self.hidden_dim, solid_name),
+                PlatonicLinear(self.hidden_dim, self.hidden_dim, readout_solid),
                 nn.GELU(),
-                PlatonicLinear(self.hidden_dim, self.num_G * output_dim, solid_name)
+                PlatonicLinear(self.hidden_dim, readout_G * output_dim, readout_solid)
             )
             self.vector_readout = nn.Sequential(
-                PlatonicLinear(self.hidden_dim, self.hidden_dim, solid_name),
+                PlatonicLinear(self.hidden_dim, self.hidden_dim, readout_solid),
                 nn.GELU(),
-                PlatonicLinear(self.hidden_dim, self.num_G * output_dim_vec * spatial_dim, solid_name)
+                PlatonicLinear(self.hidden_dim, readout_G * output_dim_vec * spatial_dim, readout_solid)
             )
         else:
-            self.scalar_readout = PlatonicLinear(self.hidden_dim, self.num_G * output_dim, solid_name)
-            self.vector_readout = PlatonicLinear(self.hidden_dim, self.num_G * output_dim_vec * spatial_dim, solid_name)
+            self.scalar_readout = PlatonicLinear(self.hidden_dim, readout_G * output_dim, readout_solid)
+            self.vector_readout = PlatonicLinear(self.hidden_dim, readout_G * output_dim_vec * spatial_dim, readout_solid)
 
     def forward(self,
                 x: Tensor,
@@ -157,65 +188,46 @@ class PlatonicTransformer(nn.Module):
                 vec: Optional[Tensor] = None,
                 avg_num_nodes: float = 1.0) -> Tensor:
         """
-        Forward pass for the Platonic Transformer.
-
         Args:
-            x (Tensor): Input node features of shape (N, input_dim).
-            pos (Tensor): Node positions of shape (N, spatial_dims).
-            batch (Tensor): Batch index for each node of shape (N,).
-            mask (Tensor, optional): Attention mask of shape (B, N) or (N, N) for dense inputs.
+            x: Node scalar features `(N, input_dim)` or `None`.
+            pos: Node positions `(N, spatial_dims)`.
+            batch: Batch index per node `(N,)`. Pass `None` for already-dense input.
+            vec: Node vector features `(N, input_dim_vec, spatial_dims)` or `None`.
+
         Returns:
-            Tensor: Final predictions. Shape is (B, output_dim) for graph tasks
-                    or (N, output_dim) for node tasks.
+            `(scalars, vectors)`. Scalars have shape `(B, output_dim)` for graph
+            tasks or `(N, output_dim)` for node tasks.
         """
+        # 1. Patchifier handles dense conversion (if requested), lifting,
+        # input embedding, and APE. Returns a 4-tuple where exactly one of
+        # mask/batch is non-None depending on the patchifier's output format.
+        x, pos, mask, batch = self.patchifier(x, vec, pos, batch)
 
-        # 1. Convert to dense format if needed
-        if self.dense_mode:
-            self._input_was_dense_format = (batch is None)
-            x, vec, pos, mask = to_dense_and_mask(x, vec, pos, batch)
-            batch = None
-        else:
-            self._input_was_dense_format = False
-            mask = None
-
-        # 2. Lift scalars and vectors, then embed
-        x = lift(x, vec, self.group)
-        x = self.x_embedder(x)  # [..., N, num_patches * C]
-        x = x + self.ape(pos) if self.ape is not None else x  # Add absolute position embedding
-
-        # 3. Equivariant Encoder (Platonic Conv Blocks)
+        # 2. Equivariant Encoder
         for layer in self.layers:
-            x = layer(
-                x=x,
-                pos=pos,
-                batch=batch,
-                mask=mask,
-                avg_num_nodes=avg_num_nodes
-            )
+            x = layer(x=x, pos=pos, batch=batch, mask=mask,
+                      avg_num_nodes=avg_num_nodes)
 
-        # 4. Post-pooling readout
+        # 3. Post-pooling readout. The patchifier records whether the *original*
+        # input was already dense; that controls how node-task readout
+        # extracts per-node features.
+        input_was_dense = getattr(self.patchifier, 'input_was_dense_format', False)
         if self.scalar_task_level == "graph":
             scalar_x = pool(x, batch, mask, avg_num_nodes, self.dense_mode, self.mean_aggregation)
         else:
-            if not self._input_was_dense_format and self.dense_mode:
-                scalar_x = x[mask]
-            else:
-                scalar_x = x
+            scalar_x = x[mask] if (not input_was_dense and self.dense_mode) else x
 
         if self.vector_task_level == "graph":
             vector_x = pool(x, batch, mask, avg_num_nodes, self.dense_mode, self.mean_aggregation)
         else:
-            if not self._input_was_dense_format and self.dense_mode:
-                vector_x = x[mask]
-            else:
-                vector_x = x
+            vector_x = x[mask] if (not input_was_dense and self.dense_mode) else x
 
         scalar_x = self.scalar_readout(scalar_x)
         vector_x = self.vector_readout(vector_x)
 
-        # 5. Extract the scalar and vector parts
-        scalars = to_scalars_vectors(scalar_x, self.output_dim, 0, self.group)[0]
-        vectors = to_scalars_vectors(vector_x, 0, self.output_dim_vec, self.group)[1]
-
-        # Return final result
+        # 4. Extract the scalar and vector parts. With trivial_readout=True
+        # the readout group is the trivial G=1 group, so to_scalars_vectors
+        # reshapes through that — symmetry is broken at the head.
+        scalars = to_scalars_vectors(scalar_x, self.output_dim, 0, self.readout_group)[0]
+        vectors = to_scalars_vectors(vector_x, 0, self.output_dim_vec, self.readout_group)[1]
         return scalars, vectors
