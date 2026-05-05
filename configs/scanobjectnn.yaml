@@ -1,0 +1,147 @@
+# ScanObjectNN PB_T50_RS Classification Configuration
+#
+# Dataset variant: PB_T50_RS — the "Hardest" subset from ScanObjectNN, with
+# per-instance translation jitter (T50%), random rotation, and random scale
+# (75%) baked into the .h5 files. Mapping: data_version=_augmentedrot_scale75
+# → training_objectdataset_augmentedrot_scale75.h5 = PB_T50_RS.
+#
+# Defaults reproduce the winning run (wandb 1d8bf0cp / elegant-admiral-73,
+# test_acc 0.8480): EdgeConv patchify + EMA + ROV + label_smoothing=0.3 +
+# up-vector frame + jitter + isotropic scaling on raw PB_T50_RS coordinates.
+
+seed: 0
+
+# Dataset configuration
+dataset:
+  name: "scanobjectnn"
+  data_dir: "./data/scanobjectnn/h5_files"
+  data_split: "main_split"                # PB_T50_RS variant
+  data_version: "_augmentedrot_scale75"
+  # Optional per-subset overrides. If unset, both fall back to data_version.
+  # Useful for: train on unaugmented base + test on the canonical augmented set.
+  # data_version_train: ""                # uncomment to train on training_objectdataset.h5
+  # data_version_test:  "_augmentedrot_scale75"
+  num_points: 2048
+
+# Augmentation (applied in dataloader/forward)
+augmentation:
+  train_augm: true                        # apply rotation aug at train time
+  inplane_augm: true                      # rotate only around the up-axis (objects are gravity-aligned)
+  test_augm: false                        # default: no rotation at test (paper convention)
+  noise_strength: 0.05                    # RandomJitter sigma (relative). 0 = disabled.
+  min_scale: 0.8
+  max_scale: 1.25
+  up_axis: 1                              # ScanObjectNN is Y-up (axis 1) per data inspection.
+                                          # The model receives one vector input channel = rot @ e_up
+                                          # (rotated up-vector); the only symmetry-breaking signal.
+  scale_in_forward: false                 # if true: sample scale per batch in forward, apply
+                                          # to data.pos AND multiply the reference frame by s.
+                                          # The dataloader scale is disabled in this mode.
+  per_sample_augm: false                  # if true: independent (rot, scale) per object in the
+                                          # batch, with the frame also computed per-object and
+                                          # broadcast to each node.
+
+# Model architecture (defaults match winner elegant-admiral-73)
+model:
+  name: "platoformer"
+  hidden_dim: 768
+  num_layers: 12
+  num_heads: 48
+  solid_name: "trivial_3"                 # trivial_3 (∅) | tetrahedron | flop_3d_1 (Flop)
+  spatial_dim: 3
+  dense_mode: true
+
+  # Pooling and readout
+  scalar_task_level: "graph"
+  vector_task_level: "graph"
+  ffn_readout: true
+  trivial_readout: false                  # if true, readout uses standard linear layers (symmetry-break at head)
+
+  # Attention block
+  mean_aggregation: false
+  attention: true
+  dropout: 0.0
+  drop_path_rate: 0.0
+  layer_scale_init_value: null
+  ffn_dim_factor: 4
+
+  # Positional encoding — sigmas tuned for raw PB_T50_RS coordinate scale.
+  rope_sigma: 18.0
+  ape_sigma: 10.0
+  learned_freqs: true
+  freq_init: "spiral"
+  use_key: false
+  rope_on_values: true                    # GTA-style; winner uses this.
+
+  # Patchification: two modes, both controlled by these flags.
+  # - edge_conv_patchify=true:  in-model learnable EdgeConv (winner choice).
+  #     Dataloader-side FPS+KNN is skipped; the model does FPS+KNN+EdgeConv
+  #     internally. patchify_num_neighbours is ignored in this mode (uses
+  #     edge_conv_k instead). FPS ratio derived from num_centers/num_points.
+  # - edge_conv_patchify=false: dataloader-side FPS + KNN with k stacked
+  #     offset vectors per center (k = patchify_num_neighbours), sorted by
+  #     distance.
+  # Either way, FPS samples patchify_num_centers centers per object.
+  patchify: true
+  patchify_num_centers: 128
+  patchify_num_neighbours: 32              # k for the standard FPS+KNN path (ignored when edge_conv).
+  edge_conv_patchify: true                 # use in-model EdgeConv patchification (winner)
+  edge_conv_k: 32                          # k for in-model EdgeConv KNN
+
+  # Compile + attention backend
+  compile: true
+  attention_backend: "flash"              # "scatter" | "flash"
+
+# Training configuration (defaults match winner)
+training:
+  epochs: 300
+  batch_size: 64
+  gradient_clip_val: 10.0
+  # EMA smoothing — winner uses decay=0.99.
+  ema_enabled: true
+  ema_decay: 0.99
+  ema_warmup_steps: 0
+  # Label smoothing for cross-entropy. PCM uses 0.3; winner uses 0.3 too.
+  label_smoothing: 0.3
+
+# Optimizer
+optimizer:
+  name: "adamw"
+  lr: 2.0e-4
+  weight_decay: 1.5e-5
+
+# Scheduler — full cosine decay to 0.
+scheduler:
+  name: "cosine"
+  warmup_epochs: 10
+
+# Logging
+logging:
+  enabled: true
+  project_name: "Platonic-ScanObjectNN-Repro"
+  # Use the public team for the ICML reproducibility runs.
+  wandb_identity: "platonic-transformers-public"
+  log_every_n_steps: 50
+
+# System
+system:
+  gpus: 1
+  num_workers: 4
+  enable_progress_bar: true
+  timer: null
+  precision: "32"
+  float32_matmul_precision: "medium"
+
+# Testing
+testing:
+  test_ckpt: null
+  resume_ckpt: null
+  # Test-time augmentation: average logits over N random rotations
+  # (forced via test_augm=true per pass). 1 = disabled.
+  repeats: 1
+
+# Checkpoint
+checkpoint:
+  monitor: "valid_acc"
+  mode: "max"
+  save_last: true

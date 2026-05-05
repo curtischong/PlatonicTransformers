@@ -8,6 +8,7 @@ DATASETS = {
     'imagenet': 'main_imagenet.py',
     'omol': 'main_omol.py',
     'qm9_regr': 'main_qm9_regr.py',
+    'scanobjectnn': 'main_scanobjectnn.py',
 }
 
 def print_usage() -> None:
