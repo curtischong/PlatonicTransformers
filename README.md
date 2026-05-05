@@ -80,7 +80,8 @@ python meta_main.py omol --predict_forces --force_weight 100
 │   ├── main_cifar10.py
 │   ├── main_imagenet.py
 │   ├── main_omol.py
-│   └── main_qm9_regr.py
+│   ├── main_qm9_regr.py
+│   └── main_scanobjectnn.py
 ├── scripts/                 # SLURM job scripts
 │   └── extract_imagenet_to_folder.py 
 │   └── extract_imagenet_to_folder.sh
@@ -88,11 +89,13 @@ python meta_main.py omol --predict_forces --force_weight 100
 ├── platonic_transformers/
 │   ├── datasets/            # Dataset loaders for supported benchmarks
 │   ├── models/              # Platonic Transformer building blocks
+│   │   ├── ape.py           # Absolute position encoding
 │   │   ├── block.py         # Core PlatonicBlock (attention + feedforward)
-│   │   ├── conv.py          # Group convolution utilities
+│   │   ├── conv.py          # Group convolution / EdgeConv
 │   │   ├── groups.py        # Symmetry group definitions for Platonic solids
 │   │   ├── io.py            # Lifting, pooling, dense/sparse utilities
 │   │   ├── linear.py        # Equivariant linear projections
+│   │   ├── patchifiers.py   # Pluggable patchifier modules (Standard, EdgeConv)
 │   │   └── platoformer.py   # Full PlatonicTransformer module
 │   └── utils                # Config loader and helper utilities
 ├── pyproject.toml           # Project configuration file
@@ -136,7 +139,7 @@ python meta_main.py omol --predict_forces --force_weight 100
 | `imagenet` | Image Classification | ImageNet-1K with NVIDIA DALI GPU-fused pipeline |
 | `qm9_regr` | Molecular Property Prediction | QM9 quantum chemistry dataset |
 | `omol` | Molecular Learning | Open Molecular Learning dataset |
-<!-- | `scanobjectnn` | 3D Object Classification | Real-world 3D scanned objects | (temporarily disabled) -->
+| `scanobjectnn` | 3D Object Classification | Real-world 3D scanned objects (PB_T50_RS) |
 
 ### Unified Entry Point 
 
@@ -147,7 +150,7 @@ Use `meta_main.py` to run any dataset training script. Each dataset automaticall
 python meta_main.py --help
 
 # Get help for a specific dataset (shows all available arguments)
-# python meta_main.py scanobjectnn --help  # (temporarily disabled)
+python meta_main.py scanobjectnn --help
 python meta_main.py qm9_regr --help
 
 # Run training
@@ -155,7 +158,7 @@ python meta_main.py qm9_regr --help
 python meta_main.py cifar10 --config configs/cifar10_small.yaml
 
 # Override individual keys from the active config
-# python meta_main.py scanobjectnn --epochs 500 --batch_size 128  # (temporarily disabled)
+python meta_main.py scanobjectnn --model.solid_name=flop_3d_1
 python meta_main.py cifar10 --batch_size 256 --lr 8e-4
 python meta_main.py qm9_regr --target mu --batch_size 96
 python meta_main.py omol --predict_forces --force_weight 100
@@ -169,6 +172,7 @@ You can also run scripts directly from the `mains/` directory:
 python mains/main_cifar10.py --batch_size 256 --lr 8e-4
 python mains/main_qm9_regr.py --target alpha --batch_size 64
 python mains/main_omol.py --predict_forces --force_weight 100
+python mains/main_scanobjectnn.py --model.solid_name=flop_3d_1
 ```
 
 ### Common Configuration Flags
@@ -264,11 +268,12 @@ python meta_main.py cifar10 --solid_name dihedral_6 ...
 - **Properties:** 12 quantum chemical properties (e.g., dipole moment μ, HOMO-LUMO gap)
 - **Key Args:** `--target {mu, alpha, homo, lumo, ...}`, `--use_bonds`
 
-<!-- ### ScanObjectNN (`scanobjectnn`) (temporarily disabled)
-- **Task:** 3D Object Classification (real-world scans)
-- **Variants:** PB_T50_RS (hardest variant with rotation and perturbations)
-- **Key Args:** `--num_points`, `--use_normals`
--->
+### ScanObjectNN (`scanobjectnn`)
+- **Task:** 3D Object Classification (real-world scans, 15 classes)
+- **Variant:** PB_T50_RS — the "hardest" subset with per-instance translation jitter (T50%), rotation, and scale (75%) baked into the dataset (default `data_version=_augmentedrot_scale75`)
+- **Default recipe (winner):** Platonic EdgeConv patchify (128 centers × k=32) + EMA (decay=0.99) + RoPE-on-values + label smoothing 0.3, on raw PB_T50_RS coordinates
+- **Key Args:** `--model.solid_name {trivial_3, tetrahedron, flop_3d_1}`, `--dataset.num_points`, `--training.label_smoothing`, `--training.ema_enabled`, `--model.edge_conv_patchify`
+- **Data:** Place ScanObjectNN h5 files under `./data/scanobjectnn/h5_files/main_split/` (download from [hkust-vgd.ust.hk/scanobjectnn](https://hkust-vgd.ust.hk/scanobjectnn/))
 
 ### ImageNet-1K (`imagenet`)
 - **Task:** Large-scale Image Classification (1000 classes)
