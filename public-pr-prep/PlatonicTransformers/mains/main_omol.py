@@ -423,6 +423,112 @@ class OMolModel(pl.LightningModule):
             return {"optimizer": optimizer, "monitor": "valid MAE (energy) [meV]"}
 
 
+class ESENModel(OMolModel):
+    """Lightning module for OMol energy + force prediction with eSEN baseline.
+
+    Wraps ``EquivariantNet`` (eSCNMDBackbone + MLP_EFS_Head, conservative-force
+    recipe) instead of ``PlatonicTransformer``. Inherits training_step / val /
+    test / configure_optimizers from OMolModel so the loss + metric pipeline
+    is identical — only the model construction and forward pass differ.
+
+    Requires ``fairchem-core>=2.19``. See ``configs/omol_esen.yaml`` for the
+    eSEN-small recipe.
+    """
+
+    def __init__(self, config: ml_collections.ConfigDict) -> None:
+        # Skip OMolModel.__init__ (would build PlatonicTransformer) — call
+        # the LightningModule base init directly.
+        pl.LightningModule.__init__(self)
+        self.save_hyperparameters({'config': config.to_dict()})
+        self.config = config
+
+        self.rotation_generator = RandomSOd(3)
+
+        from platonic_transformers.models.baseline.esen.eqv_net import EquivariantNet
+        m = config.model
+        self.net = EquivariantNet(
+            max_num_elements=getattr(m, "max_num_elements", 100),
+            sphere_channels=m.sphere_channels,
+            hidden_channels=m.hidden_channels,
+            lmax=m.lmax,
+            mmax=m.mmax,
+            num_layers=m.num_layers,
+            cutoff=m.cutoff,
+            max_neighbors=m.max_neighbors,
+            otf_graph=m.otf_graph,
+            direct_forces=m.direct_forces,
+            regress_forces=m.regress_forces,
+            regress_stress=m.regress_stress,
+            activation_checkpointing=m.activation_checkpointing,
+            norm_type=m.norm_type,
+            act_type=m.act_type,
+            ff_type=m.ff_type,
+            chg_spin_emb_type=m.chg_spin_emb_type,
+        )
+
+        # Common buffers + metrics, mirroring OMolModel's shared init.
+        self.register_buffer('shift', torch.tensor(0.0, dtype=torch.float32))
+        self.register_buffer('scale', torch.tensor(1.0, dtype=torch.float32))
+        self.register_buffer('avg_num_nodes', torch.tensor(1.0, dtype=torch.float32))
+
+        # chgspin is handled internally by eSCNMDBackbone (via chg_spin_emb_type),
+        # not through the Platonic FiLM path. Tell the inherited helpers we don't
+        # have a top-level mix.
+        self.charge_embedder = None
+        self.spin_embedder = None
+        self.chgspin_mix = None
+        self.chgspin_mode = "off"
+        self.chgspin_film_enabled = False
+
+        self.train_metric = torchmetrics.MeanAbsoluteError()
+        self.train_metric_force = torchmetrics.MeanAbsoluteError()
+        self.train_metric_energy_per_atom = torchmetrics.MeanAbsoluteError()
+        self.valid_metric = torchmetrics.MeanAbsoluteError()
+        self.valid_metric_force = torchmetrics.MeanAbsoluteError()
+        self.valid_metric_energy_per_atom = torchmetrics.MeanAbsoluteError()
+        self.test_metrics_energy = torchmetrics.MeanAbsoluteError()
+        self.test_metrics_force = torchmetrics.MeanAbsoluteError()
+        self.test_metrics_energy_per_atom = torchmetrics.MeanAbsoluteError()
+
+        # Element reference energies — same path as OMolModel.
+        element_refs_path = getattr(self.config.dataset, "element_refs_path", None)
+        if element_refs_path:
+            if not os.path.isabs(element_refs_path):
+                element_refs_path = os.path.join(REPO_ROOT, element_refs_path)
+            with open(element_refs_path, "r") as f:
+                refs_data = yaml.safe_load(f)
+            refs = refs_data.get("oc20_elem_refs", refs_data)
+            self.register_buffer("element_refs", torch.tensor(refs, dtype=torch.float64))
+        else:
+            self.element_refs = None
+
+    def forward(self, graph):
+        graph = graph.to(self.device)
+        num_graphs = int(graph.batch.max().item()) + 1
+        device = graph.pos.device
+        data = {
+            "pos": graph.pos,
+            "batch": graph.batch,
+            "atomic_numbers": graph.atomic_numbers,
+            "natoms": getattr(graph, "num_atoms", None),
+            "charge": getattr(
+                graph, "charge",
+                torch.zeros(num_graphs, dtype=torch.float32, device=device),
+            ),
+            "spin": getattr(
+                graph, "spin",
+                torch.zeros(num_graphs, dtype=torch.float32, device=device),
+            ),
+        }
+        out = self.net(data)
+        return out["energy"], out["forces"]
+
+    def pred_energy_and_force(self, graph):
+        # eSEN backbone+head computes both in one forward (forces via autograd
+        # through MLP_EFS_Head). No separate autograd step needed.
+        return self(graph)
+
+
 def main(config: ml_collections.ConfigDict) -> None:
     """Train and evaluate the Platonic Transformer on the OMol dataset."""
     pl.seed_everything(config.seed)
@@ -463,10 +569,22 @@ def main(config: ml_collections.ConfigDict) -> None:
     if config.system.timer:
         callbacks.append(Timer(duration=config.system.timer))
    
-    if config.testing.load_weights:
-        model = OMolModel.load_from_checkpoint(checkpoint_path=config.testing.load_weights, config=config)
+    # Select model class by config.model.name. "platoformer" (default) uses
+    # OMolModel; "esen" uses the eSCNMDBackbone-based baseline.
+    model_name = getattr(config.model, "name", "platoformer").lower()
+    if model_name == "esen":
+        ModelCls = ESENModel
+    elif model_name == "platoformer":
+        ModelCls = OMolModel
     else:
-        model = OMolModel(config)
+        raise ValueError(
+            f"Unknown model.name='{model_name}'. Supported: 'platoformer', 'esen'."
+        )
+
+    if config.testing.load_weights:
+        model = ModelCls.load_from_checkpoint(checkpoint_path=config.testing.load_weights, config=config)
+    else:
+        model = ModelCls(config)
 
     if hasattr(train_loader.dataset, 'scale'):
         model.scale = torch.tensor(train_loader.dataset.scale).to(model.device)
