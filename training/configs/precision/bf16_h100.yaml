@@ -1,0 +1,21 @@
+# @package _global_
+# Production preset for H100: bf16-mixed forward, TF32 fallback for residual fp32
+# matmul, torch.compile with dynamic shapes (so dyn-batching doesn't recompile-thrash).
+#
+# Selected via: `+precision=bf16_h100` on the launch command.
+# When compile=true, train_omol.py automatically applies the dynamo cache_size_limit /
+# force_parameter_static_shapes / capture_scalar_outputs tunings that the diagnostic
+# in 22569081 showed are required for compile to actually deliver speedup on this
+# model + dyn-batching combo.
+
+trainer:
+  precision: bf16-mixed
+
+matmul_precision: high
+cudnn_benchmark: true
+cudnn_deterministic: false
+
+force_field_module:
+  compile: true
+  compile_dynamic: true
+  compile_mode: default

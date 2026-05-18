@@ -1,343 +1,367 @@
-# Platonic Transformers: A Solid Choice For Equivariance
+# Platonic Transformer for OMol25
 
-<p align="left">
-  <a href="https://www.arxiv.org/abs/2510.03511"><img src="https://img.shields.io/badge/arXiv-2510.03511-b31b1b.svg" alt="arXiv"></a>
-  <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.3+-ee4c2c.svg" alt="PyTorch"></a>
-  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.12+-3776ab.svg" alt="Python"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License"></a>
-</p>
+Training, evaluation, and leaderboard submission for the **Platonic Transformer** on the [OMol25](https://fair-chem.github.io/molecules/datasets/omol25.html) molecular force field benchmark.
 
+**Goal:** Achieve competitive results on the [FAIR Chemistry Leaderboard](https://huggingface.co/spaces/facebook/fairchem_leaderboard) using equivariant Platonic Transformers.
 
-
-<a href="https://www.arxiv.org/abs/2510.03511"> Platonic Transformers: A Solid Choice For Equivariance</a> by <a href="https://niazoys.github.io">Mohammad Mohaiminul Islam</a>, <a href="https://rish-16.github.io/">Rishabh Anand</a>, <a href="https://amlab.science.uva.nl/people/DavidWessels/">David R. Wessels</a>, <a href="https://www.linkedin.com/in/friso-de-kruiff/">Friso de Kruiff</a>, <a href="https://pure.amsterdamumc.nl/en/persons/thijs-kuipers-3">Thijs P. Kuipers</a>, <a href="https://www.cs.yale.edu/homes/ying-rex/">Rex Ying</a>, <a href="https://qurai.amsterdam/researcher/clarisa-sanchez/">Clara I. Sánchez</a>, <a href="https://amlab.science.uva.nl/people/SharvareeVadgama/">Sharvaree Vadgama</a>, <a href="https://georg-bn.github.io/">Georg Bökman</a>, <a href="https://ebekkers.github.io/">Erik J. Bekkers</a>
-
-Welcome to the Platonic Transformer project, where geometric group theory meets modern attention architectures 🌟. This repository contains research code for **Platonic Transformers**, a drop-in way to add geometric inductive biases to vanilla Transformers.
-
-
-<p align="center">
-  <img src="platonic_transformers/models/platoformer-mainfig-vfinal-1.png" alt="Platonic Transformer Architecture" width="800"/>
-</p>
-
-
-
-## 📄 About the Paper
-
-**Platonic Transformers** provide a drop-in method to build geometric inductive biases into the standard Transformer architecture, achieving approximate SE(2), E(2), SE(3), or E(3) equivariance at no additional computational cost. Our approach is based on:
-
-- **Frame-relative attention.** Point-wise features are lifted to functions on a finite roto-reflection group; each group element acts as a reference frame, and attention (with RoPE) runs in parallel across frames with shared weights.
--   **Equivariance by design.** This yields **translation equivariance** (via RoPE) and **discrete roto-reflectional equivariance** (via weight sharing over the chosen group), without changing the attention mechanism.
--   **Dynamic group convolution.** Omitting softmax turns attention into a **linear-time, content-aware group convolution** equivalent.
--   **Cross-domain applicability.** Competitive results across CIFAR-10 (images), ScanObjectNN (3D), QM9 & OMol25 (molecular learning).
-
-
-
-## ✨ Key Features
-
-- 🔷 **Group-Equivariant Attention** — Based on the symmetries of Platonic solids (e.g., tetrahedron with 12, or octahedron 24 rotations).
-- 🔄 **Unified Scalar/Vector I/O** — Equivariantly processes scalar and vector features as both input and output.
-- 🔳 **Generalizes Standard Transformers** — The standard Transformer architecture is recovered by choosing the trivial symmetry group.
-- 🎯 **Multiple Benchmarks** — CIFAR-10, QM9 regression, ScanObjectNN, and OMol25.
-- ⚡ **Linear-Time Variant** — Dynamic group convolution by dropping softmax.
-- 🛠️ **Easy to Use** — Unified `meta_main.py` entry point for all datasets.
-
-
-
-## 🚀 Quick Start
-
-With `pip` (to use in other repositories):
-```bash
-pip install "platonic_transformers @ git+https://github.com/niazoys/PlatonicTransformer.git"
-```
-
-In a dedicated environment (to run the paper's experiments):
-```bash
-# Clone and setup
-git clone https://github.com/niazoys/PlatonicTransformer.git
-cd PlatonicTransformer
-chmod +x setup.sh && ./setup.sh
-source .venv/bin/activate
-
-
-# Train on CIFAR-10 (loads configs/cifar10_deit.yaml)
-python meta_main.py cifar10 --batch_size 256 --lr 8e-4
-
-# Train on QM9 molecular properties (loads configs/qm9_regr.yaml)
-python meta_main.py qm9_regr --target mu --batch_size 96
-
-# Train on OMol energy/force regression (loads configs/omol.yaml)
-python meta_main.py omol --predict_forces --force_weight 100
-```
-
-> **Note:** The rest of this README will provide instructions for running experiments within a dedicated environment.
-
-## 📂 Repository Structure
-```
-.
-├── meta_main.py             # 🎯 Unified entry point for all datasets
-├── configs/                 # Dataset-specific YAML configs
-├── data/                    # Downloaded datasets and artifacts
-├── mains/                   # Dataset-specific training scripts
-│   ├── main_cifar10.py
-│   ├── main_imagenet.py
-│   ├── main_omol.py
-│   ├── main_qm9_regr.py
-│   └── main_scanobjectnn.py
-├── scripts/                 # SLURM job scripts
-│   └── extract_imagenet_to_folder.py 
-│   └── extract_imagenet_to_folder.sh
-│   └── run_dali_test.sh
-├── platonic_transformers/
-│   ├── datasets/            # Dataset loaders for supported benchmarks
-│   ├── models/              # Platonic Transformer building blocks
-│   │   ├── ape.py           # Absolute position encoding
-│   │   ├── block.py         # Core PlatonicBlock (attention + feedforward)
-│   │   ├── conv.py          # Group convolution / EdgeConv
-│   │   ├── groups.py        # Symmetry group definitions for Platonic solids
-│   │   ├── io.py            # Lifting, pooling, dense/sparse utilities
-│   │   ├── linear.py        # Equivariant linear projections
-│   │   ├── patchifiers.py   # Pluggable patchifier modules (Standard, EdgeConv)
-│   │   └── platoformer.py   # Full PlatonicTransformer module
-│   └── utils                # Config loader and helper utilities
-├── pyproject.toml           # Project configuration file
-├── requirements.txt         # Python dependencies
-├── setup.sh                 # Environment setup script
-```
-
-
-## 🔧 Installation
-
-### Prerequisites
-- Python 3.12+
-- CUDA 12.1+ (for GPU support)
-- PyTorch 2.3+
-
-### Setup
-
-1. **Clone the repository** and install system dependencies if needed.
-2. **Create the environment:**
-   ```bash
-   chmod +x setup.sh
-   ./setup.sh
-   ```
-3. **Activate the environment:**
-   ```bash
-   source .venv/bin/activate
-   ```
-4. **Authenticate with Weights & Biases** (optional, for experiment tracking):
-   ```bash
-   wandb login
-   ```
-
-
-## 🎮 Usage
-
-### Available Datasets
-
-| Dataset | Task | Description |
-|---------|------|-------------|
-| `cifar10` | Image Classification | CIFAR-10 with patch-based point cloud representation |
-| `imagenet` | Image Classification | ImageNet-1K with NVIDIA DALI GPU-fused pipeline |
-| `qm9_regr` | Molecular Property Prediction | QM9 quantum chemistry dataset |
-| `omol` | Molecular Learning | Open Molecular Learning dataset |
-| `scanobjectnn` | 3D Object Classification | Real-world 3D scanned objects (PB_T50_RS) |
-
-### Unified Entry Point 
-
-Use `meta_main.py` to run any dataset training script. Each dataset automatically loads its YAML configuration from `configs/<dataset>.yaml`. Pass `--config path/to/custom.yaml` to replace the entire config file, and layer additional CLI flags on top for quick tweaks:
+## Quick start (existing environment)
 
 ```bash
-# List available datasets
-python meta_main.py --help
-
-# Get help for a specific dataset (shows all available arguments)
-python meta_main.py scanobjectnn --help
-python meta_main.py qm9_regr --help
-
-# Run training
-# Swap in a different config
-python meta_main.py cifar10 --config configs/cifar10_small.yaml
-
-# Override individual keys from the active config
-python meta_main.py scanobjectnn --model.solid_name=flop_3d_1
-python meta_main.py cifar10 --batch_size 256 --lr 8e-4
-python meta_main.py qm9_regr --target mu --batch_size 96
-python meta_main.py omol --predict_forces --force_weight 100
+cd training
+export DATA_PATH=/path/to/omol25       # parent dir containing open_mol/{train_4M,val}
+python train_omol.py \
+    force_field_module=platoformer \
+    data=omol_4m \
+    force_field_module.compile=true \
+    force_field_module.net.hidden_dim=1728 \
+    force_field_module.net.nhead=36 \
+    force_field_module.net.num_layers=12 \
+    force_field_module.net.solid_name=tetrahedron \
+    force_field_module.net.attention_backend=flash \
+    force_field_module.net.chgspin_mode=add \
+    force_field_module.train_augmentation=o3 \
+    +force_field_module.optimizer.r=2.0 \
+    force_field_module.train_rmsd=1.433569 \
+    exp_name=platoformer-omol \
+    wandb.group=platonic-omol
 ```
 
-### Direct Script Execution (Alternative)
+For long-running cluster jobs, use the SLURM scripts in `scripts/`.
 
-You can also run scripts directly from the `mains/` directory:
+## Setting up a fresh cluster
+
+The setup has four stages: clone, venv, flash-attn build, data. Stages 3 and 4 each take 30-60 minutes and can run in parallel.
+
+### 1. Clone the repo
 
 ```bash
-python mains/main_cifar10.py --batch_size 256 --lr 8e-4
-python mains/main_qm9_regr.py --target alpha --batch_size 64
-python mains/main_omol.py --predict_forces --force_weight 100
-python mains/main_scanobjectnn.py --model.solid_name=flop_3d_1
+git clone git@github.com:ebekkers/platonic-omol.git
+cd platonic-omol
+git checkout upstream-port-pt2     # or main, once merged
 ```
 
-### Common Configuration Flags
+### 2. Create a venv and install Python deps
 
-**Model Architecture:**
-- `--solid_name` - Platonic solid: `{tetrahedron, octahedron, icosahedron, trivial_3}` (default: octahedron)
-- `--hidden_dim` - Hidden dimension size
-- `--layers` - Number of transformer layers
-- `--num_heads` - Number of attention heads
+We use Python 3.12 + uv (or plain pip — uv is just faster).
 
-  **Note on Hidden Dimension:** For the model to work correctly, `--hidden_dim` must be divisible by both the order of the chosen group (`|G|`) and the specified `--num_heads`. The internal dimensions for attention are calculated automatically from these values.
-
-  **Example:**
-  Let's say you use `--solid_name tetrahedron`, `--hidden_dim 768`, and `--num_heads 48`.
-  - The `tetrahedron` group has an order `|G| = 12`.
-  - The feature dimension per group element is `hidden_dim / |G| = 768 / 12 = 64`.
-  - The dimension of each attention head is `hidden_dim / num_heads = 768 / 48 = 16`.
-  - The number of independent heads applied to each group element's features is `(hidden_dim / |G|) / (hidden_dim / num_heads) = 64 / 16 = 4`.
-  
-  This means the model will run 4 attention heads per group element, where each head has a dimension of 16.
-
-**Positional Encodings:**
-- `--rope_sigma` - Sigma for Rotational Positional Encoding (RoPE)
-- `--ape_sigma` - Sigma for Absolute Positional Encoding (APE)
-- `--freq_init` - Frequency initialization: `{random, spiral}`
-
-**Training:**
-- `--epochs` - Number of training epochs
-- `--batch_size` - Training batch size
-- `--lr` - Learning rate
-- `--weight_decay` - Weight decay for optimizer
-- `--seed` - Random seed for reproducibility
-
-**System:**
-- `--gpus` - Number of GPUs to use
-- `--num_workers` - Number of data loading workers
-- `--log` - Enable/disable WandB logging
-
-💡 **Tip:** Start with smaller `--hidden_dim` (e.g., 64) and fewer `--layers` to validate pipelines quickly!
-
-
-
-## 🧠 Model Architecture
-
-**Platonic Transformers** leverage the rotational symmetries of Platonic solids to enforce SE(3)-equivariance in attention mechanisms. The architecture is implemented in `platonic_transformers/models/platoformer/`.
-
-### Core Components
-
-- **Lifting** (`io.py`) - Maps scalar and vector node features to group-aligned channels
-- **Attention Blocks** (`block.py`) - Stacked `PlatonicBlock` layers with group-aware attention and equivariant MLPs
-- **Equivariant Convolutions** (`conv.py`) - SE(3)-equivariant convolution layers
-- **Group Theory** (`groups.py`) - Platonic solid symmetry group implementations
-- **Positional Encodings** - Dual encoding strategy:
-  - **RoPE** (`rope.py`) - Rotational Positional Encoding for relative positions
-  - **APE** (`ape.py`) - Absolute Positional Encoding for global context
-- **Readout** (`io.py`) - Separate scalar/vector readouts with pooling for graph or node-level predictions
-
-### Supported Platonic Solids
-
-| CLI label(s)                         | Dim | Type                              | Order (\|G\|)                                | Notes / Typical use                                                                 |
-|-------------------------------------|-----|------------------------------------|---------------------------------------------|--------------------------------------------------------------------------------------|
-| `trivial`                           | 3   | Identity only                      | 1                                           | 3D baseline (no rotational bias); translation handled via RoPE.                     |
-| `trivial_n` (n = 2…10)              | n   | Identity only                      | 1                                           | Identity-only group in chosen dimension; e.g., `trivial_2`, `trivial_3`, …          |
-| `tetrahedron`                       | 3   | Platonic rotational                | 12                                          | **Default**: lightweight 3D rotational equivariance; fewer frames/compute.          |
-| `octahedron`                        | 3   | Platonic rotational                | 24                                          | Higher capacity than tetra; balanced accuracy/compute.                              |
-| `icosahedron`                       | 3   | Platonic rotational                | 60                                          | Highest rotational expressivity; most frames/compute.                               |
-| `octahedron_reflections`            | 3   | Axis-aligned reflections (x/y/z)   | 8                                           | Independent flips about x, y, z; useful when parity (mirror) cues matter.           |
-| `cyclic_n` (n = 2…20)               | 2   | Rotation-only                      | \(n\)                                       | 2D discrete rotations; e.g., `cyclic_4`, `cyclic_6`.                                |
-| `dihedral_n` (n = 2…20)             | 2   | Rotations + reflections            | \(2n\)                                      | 2D rotations **and** mirror symmetry; e.g., `dihedral_4`, `dihedral_6`.             |
-| `flop_2d_<axis>` (axis = 1, 2)      | 2   | Single-axis reflection             | 2                                           | Axis 1: reflect across x-axis (flip y); Axis 2: reflect across y-axis (flip x).    |
-| `flop_3d_<axis>` (axis = 1, 2, 3)   | 3   | Single-axis reflection             | 2                                           | Axis 1: YZ-plane (flip x); Axis 2: XZ-plane (flip y); Axis 3: XY-plane (flip z).   |
-
-**Examples**
 ```bash
-# Default (3D rotational, 12 frames)
-python meta_main.py omol --solid_name tetrahedron ...
-
-# 2D rotation-only / rotations+reflections
-python meta_main.py cifar10 --solid_name cyclic_4 ...
-python meta_main.py cifar10 --solid_name dihedral_6 ...
+uv venv --python 3.12 venv
+source venv/bin/activate
+pip install --upgrade pip wheel setuptools
 ```
 
+**Important: the `lightning` PyPI package is currently quarantined**, so a plain `pip install lightning` fails with `No matching distribution found`. Build it from source instead:
 
-## 📊 Datasets
-
-### CIFAR-10 (`cifar10`)
-- **Task:** Image Classification (10 classes)
-- **Representation:** Patches converted to point clouds
-- **Key Args:** `--patch_size`, `--num_points_per_patch`
-
-### QM9 (`qm9_regr`)
-- **Task:** Molecular Property Regression
-- **Properties:** 12 quantum chemical properties (e.g., dipole moment μ, HOMO-LUMO gap)
-- **Key Args:** `--target {mu, alpha, homo, lumo, ...}`, `--use_bonds`
-
-### ScanObjectNN (`scanobjectnn`)
-- **Task:** 3D Object Classification (real-world scans, 15 classes)
-- **Variant:** PB_T50_RS — the "hardest" subset with per-instance translation jitter (T50%), rotation, and scale (75%) baked into the dataset (default `data_version=_augmentedrot_scale75`)
-- **Default recipe (winner):** Platonic EdgeConv patchify (128 centers × k=32) + EMA (decay=0.99) + RoPE-on-values + label smoothing 0.3, on raw PB_T50_RS coordinates
-- **Key Args:** `--model.solid_name {trivial_3, tetrahedron, flop_3d_1}`, `--dataset.num_points`, `--training.label_smoothing`, `--training.ema_enabled`, `--model.edge_conv_patchify`
-- **Data:** Place ScanObjectNN h5 files under `./data/scanobjectnn/h5_files/main_split/` (download from [hkust-vgd.ust.hk/scanobjectnn](https://hkust-vgd.ust.hk/scanobjectnn/))
-
-### ImageNet-1K (`imagenet`)
-- **Task:** Large-scale Image Classification (1000 classes)
-- **Representation:** Images patchified into 2D point clouds (14x14 = 196 patches at patch size 16)
-- **Data Pipeline:** NVIDIA DALI GPU-fused preprocessing (decode, crop, augment on GPU)
-- **Augmentation:** ThreeAugment, RandAugment, ColorJitter, RandomErasing, Mixup/CutMix
-- **Key Args:** `--dataset.image_size`, `--dataset.patch_size`, `--training.batch_size`
-- **Config:** `configs/imagenet_dali.yaml`
-
-**Running on SLURM (single H100):**
 ```bash
-sbatch scripts/run_imagenet_1gpu.sh
+git clone --branch 2.5.5 --depth 1 https://github.com/Lightning-AI/pytorch-lightning.git /tmp/pytorch-lightning
+cd /tmp/pytorch-lightning
+PACKAGE_NAME=lightning pip install --no-deps .
+cd -
 ```
 
-**Running directly:**
+This produces both the `lightning` and `lightning_fabric` namespaces (what our code imports). Then install the rest:
+
 ```bash
-python mains/main_imagenet.py \
-    --config configs/imagenet_dali.yaml \
-    --dataset.data_dir=/path/to/imagenet  # ImageFolder layout with train/ and val/
+pip install hydra-core omegaconf rootutils humanize ase lmdb schedulefree wandb e3nn matplotlib Pillow
+pip install 'git+https://github.com/facebookresearch/fairchem.git@fairchem_core-2.0.0#subdirectory=packages/fairchem-core'
 ```
 
-> **Note:** ImageNet training requires an NVIDIA DALI installation (`nvidia-dali-cuda120`) and a GPU. The data directory must follow PyTorch ImageFolder layout (`train/<class>/` and `val/<class>/`).
+`torch-cluster` and `torch-scatter` are listed in `requirements.txt` but **not actually needed** for PT-2: the only `torch_cluster.knn_graph` usage is wrapped in a try/except and `torch_scatter` calls have been replaced with native `Tensor.scatter_add_`. Skip them — they need GPU-side compilation that often fails on login nodes.
 
-### Open Molecular (`omol`)
-- **Task:** Molecular Property Prediction with LMDB backend
-- **Features:** Large-scale molecular learning with atomic embeddings
-- **Key Args:** `--radius`, `--max_neighbors`
+Verify the import chain:
 
-
-
-## 📖 Citation
-
-If you use Platonic Transformers in your research, please cite:
-
-```bibtex
-@misc{islam2025platonictransformerssolidchoice,
-      title={Platonic Transformers: A Solid Choice For Equivariance}, 
-      author={Mohammad Mohaiminul Islam and Rishabh Anand and David R. Wessels and Friso de Kruiff and Thijs P. Kuipers and Rex Ying and Clara I. Sánchez and Sharvaree Vadgama and Georg Bökman and Erik J. Bekkers},
-      year={2025},
-      eprint={2510.03511},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2510.03511}, 
-}
+```bash
+python -c "import torch, lightning, hydra, schedulefree, fairchem; \
+  from fairchem.core.datasets import AseDBDataset; \
+  print('torch', torch.__version__, 'cuda', torch.version.cuda); \
+  print('lightning', lightning.__version__); \
+  print('AseDBDataset OK')"
 ```
 
+### 3. Install flash-attn
 
+**Try a pre-built wheel first** (fast path, works whenever your torch+CUDA combo matches an upstream release). Look up your torch ABI:
 
-## 📝 License
+```bash
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, \
+  'cxx11abi', torch._C._GLIBCXX_USE_CXX11_ABI)"
+```
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+Then pick a matching wheel from [Dao-AILab/flash-attention releases](https://github.com/Dao-AILab/flash-attention/releases). Example for torch 2.6 + cu12 + Python 3.12 + cxx11abiFALSE (what fairchem-core 2.0.0 pulls in):
 
+```bash
+pip install 'https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1%2Bcu12torch2.6cxx11abiFALSE-cp312-cp312-linux_x86_64.whl'
+```
 
-## 🤝 Contributing
+Verify:
 
-Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
+```bash
+python -c "from flash_attn import flash_attn_varlen_func; import flash_attn; print('flash_attn', flash_attn.__version__, 'OK')"
+```
 
+**Fallback: build from source** (if no matching wheel exists, e.g., torch 2.11+ on Snellius). **Use a GPU compute node, not the login node** — CUDA dev tools and ~120GB RAM for the compile. Set `TORCH_CUDA_ARCH_LIST` to your GPU's arch:
 
-## 📬 Contact
-For questions or issues:
-- Open an issue on GitHub
-- Email us [here](mailto:m.m.islam@uva.nl,e.j.bekkers@uva.nl)
+| GPU | arch | TORCH_CUDA_ARCH_LIST |
+|---|---|---|
+| H100 (Snellius gpu_h100) | sm_90 | "9.0" |
+| RTX 6000 Ada (hipster performance) | sm_89 | "8.9" |
+| L4 (hipster capacity) | sm_89 | "8.9" |
+| A100 | sm_80 | "8.0" |
 
+Adapt `scripts/install_flash_attn.sh` (templated for Snellius); key env vars:
 
+```bash
+export TORCH_CUDA_ARCH_LIST="8.9"                # 9.0 for H100
+export MAX_JOBS=2                                # 4 OOM'd at 32G; 2 fits in ~120G
+export FLASH_ATTENTION_FORCE_BUILD=TRUE
+export CUDA_HOME=/path/to/cuda                   # e.g. $EBROOTCUDA on Snellius
+pip install flash-attn --no-build-isolation
+```
 
-<!-- *🚀🚀🚀Happy Experimenting! 🚀🚀🚀* -->
+Source builds take 30-90 minutes.
 
+### 4. Download OMol25-4M data (~45GB)
+
+OMol25-4M is the curated 4M-sample subset eSEN uses for fast iteration. Both files are on FAIR's public file server (no HF auth needed):
+
+```bash
+mkdir -p $DATA_DIR/open_mol     # e.g. DATA_DIR=/scratch/$USER/omol
+cd $DATA_DIR/open_mol
+wget https://dl.fbaipublicfiles.com/opencatalystproject/data/omol/250514/train_4M.tar.gz
+wget https://dl.fbaipublicfiles.com/opencatalystproject/data/omol/250514/val.tar.gz
+tar -xzf train_4M.tar.gz && rm train_4M.tar.gz
+tar -xzf val.tar.gz && rm val.tar.gz
+```
+
+After extraction you'll have `train_4M/data*.aselmdb` (~22GB, 4M samples) and `val/data*.aselmdb` (~20GB, 2.76M heldout samples). Set:
+
+```bash
+export DATA_PATH=$DATA_DIR     # parent of open_mol/
+```
+
+**Don't confuse this with `OMol25 neutral_train`** — that's a different curation (charge=0 only). The Hydra `data=omol_4m` config expects the 4M shards above; `data=omol` expects the neutral split.
+
+### 5. Smoke test
+
+A 1-epoch dry-run on a tiny model verifies the install end-to-end:
+
+```bash
+cd training
+python train_omol.py \
+    force_field_module=platoformer \
+    data=omol_4m \
+    data.datamodule.batch_size.train=4 \
+    force_field_module.compile=false \
+    force_field_module.net.attention_backend=flash \
+    force_field_module.net.chgspin_mode=add \
+    force_field_module.net.num_layers=2 \
+    force_field_module.net.hidden_dim=144 \
+    force_field_module.net.nhead=4 \
+    +trainer.limit_train_batches=2 \
+    +trainer.limit_val_batches=2 \
+    trainer.max_epochs=1 \
+    wandb.use_wandb=false \
+    exp_name=smoke
+```
+
+Should finish in <2 minutes on any modern GPU.
+
+## Recent fixes
+
+- **2026-05-11 (`deeaea2`)** — fixed a dtype mismatch in
+  `nets/platoformer/platoformer.py` where the readout subnetwork hard-cast inputs
+  to `.double()` but left the readout weights in whatever dtype the model was
+  instantiated with. Default fp32 launches crashed with `expected mat1 and mat2
+  to have the same dtype, but got: double != float`. The fix matches readout
+  weight dtype, so fp32 stays fp32 and `+precision=fp64_baseline` still upcasts
+  cleanly.
+- **2026-05-11 (this commit)** — added direct-vs-conservative branching in
+  `nets/uma/model.py`. Conservative (autograd-grad) forces use `MLP_EFS_Head`;
+  direct forces use a separate `Linear_Energy_Head` + `Linear_Force_Head` pair.
+  The earlier wrapper assumed `MLP_EFS_Head` always emits a `forces` key, which
+  isn't true in direct mode — fixed by reading from the appropriate head.
+
+If you pulled before May 11, just `git pull origin main`.
+
+## eSEN baseline (fairchem)
+
+Two paths to compare against eSEN:
+
+**(a) Use the released checkpoint** — fastest way to get the paper's published
+eSEN-sm or eSEN-md. The OMol25 weights live on Hugging Face behind a gated repo
+(accept terms at https://huggingface.co/facebook/OMol25):
+
+```bash
+export HF_TOKEN=<your-hf-token>   # https://huggingface.co/settings/tokens
+python -c "from huggingface_hub import hf_hub_download; \
+  print(hf_hub_download('facebook/OMol25', 'checkpoints/esen_sm_direct_all.pt'))"
+```
+
+The downloaded checkpoint is a `fairchem.core.units.mlip_unit.api.inference.MLIPInferenceCheckpoint`;
+load with `torch.load(path, map_location='cpu', weights_only=False)` and read
+`ckpt.model_config["backbone"]` for the full hyperparameter dict. The released
+eSEN-sm-direct is **6,333,093 params**: `sphere_channels=128, hidden_channels=128,
+lmax=2, mmax=2, num_layers=5, direct_forces=true`. eSEN-md-direct is 50.67M: same
+width/mmax, but `lmax=4`, `num_layers=10`. eSEN-sm-conserving has effectively the
+same architecture (just trained with conservative loss).
+
+**(b) Train from scratch** — for an apples-to-apples comparison against PT under
+matched data, optimizer, and precision. Two configs are provided:
+
+- `force_field_module=esen` — Ngo & Ravanbakhsh's smaller default (sphere=32,
+  lmax=4, 12 layers, 3.4M params). Slower per atom than the paper's eSEN-sm
+  because higher lmax dominates eSCN compute.
+- `force_field_module=esen_sm` — **paper-matching** config (sphere=128, lmax=2,
+  5 layers, `direct_forces=true`, ~6.07M params). Mirrors the released
+  `esen_sm_direct_all.pt` checkpoint on the 3 dominant architectural knobs.
+  `torch.compile=true` by default.
+
+**Direct vs conservative — pick direct for training.** Conservative
+(`direct_forces=false`) computes forces by `torch.autograd.grad(energy, pos)`.
+That makes training a **double-backward** (forces are themselves a backward;
+loss requires another backward through them), which:
+
+- triples activation memory vs a direct-force model (eSEN-sm conservative OOMs
+  at `max_atoms=8000` on a 96GB H100; direct fits 20000+);
+- breaks `torch.compile` (donated-buffer optimization assumes single backward).
+
+The published AllScAIP Figure 5 "filled-circle direct" eSEN points are direct
+variants — that's what we're comparing against, so `direct_forces=true` is both
+the cheaper and the more apples-to-apples choice.
+
+Launch the 20-epoch eSEN-sm training-from-scratch run on Snellius:
+
+```bash
+sbatch scripts/run_esen_sm_20ep.sh                        # default max_atoms=20000
+sbatch --export=ALL,MAX_ATOMS=12000 scripts/run_esen_sm_20ep.sh
+```
+
+`MAX_ATOMS` is parametric (default 20000 — the largest batch we've validated
+on H100 with direct + compile). Recipe mirrors PT's: AdamW +
+cosine_annealing_ws, lr=5e-4, wd=1e-5, 1% fractional warmup, dynamic batching,
+fp32 precision.
+
+## Apples-to-apples PT-vs-eSEN-sm comparison (20 epoch, max_atoms=20000)
+
+Submit both runs side-by-side on the same node config (1× H100, 5d cap):
+
+```bash
+# eSEN-sm direct + compile, 20ep, max_atoms=20000 (~14h projected wall)
+sbatch scripts/run_esen_sm_20ep.sh
+
+# PT-2 sin/sin rs=2.0 EMA=0.99, 20ep, max_atoms=20000 (matches eSEN batch size)
+sbatch --export=ALL,MAX_ATOMS=20000,WD=1e-5,LAYER_SCALE=1e-4,FFN_FACTOR=2,\
+ACTIVATION=sin,READOUT_ACTIVATION=sin,ROPE_SIGMA=2.0,EMA_DECAY=0.99 \
+  --job-name=PT2-rs2-ema0.99-20ep-n20000 \
+  scripts/run_pt2_h1920_l8_20ep_fp32.sh
+```
+
+Both share `omol-leaderboard/scaling-laws-symmetry` W&B project under the
+`pt2-vs-esen-sm-direct-n20000` group.
+
+## Inference throughput benchmark
+
+`benchmark_ns_per_day.py` measures `ns/day` on a single H100 at N=1000 atoms,
+forward-only, fp32 + TF32. Methodology mirrors Qu et al. 2026 (AllScAIP) Table 2.
+Optional `torch.compile`, `cudnn.benchmark`, and `activation_checkpointing` knobs
+let you reproduce paper-style "fast" timings:
+
+```bash
+# Eager (legacy) — matches our pre-2026-05-11 numbers
+sbatch --export=ALL,MODEL=platoformer scripts/run_benchmark_ns_per_day.sh
+sbatch --export=ALL,MODEL=esen        scripts/run_benchmark_ns_per_day.sh
+
+# Paper-matching eSEN-sm architecture (sphere=128, lmax=2, L=5, ~6M params)
+sbatch --export=ALL,MODEL=esen_paper scripts/run_benchmark_ns_per_day.sh
+
+# Compiled + cudnn.benchmark + AC off (paper-style fast)
+sbatch --export=ALL,MODEL=esen_paper,COMPILE=true,AC=false,CUDNN_BENCH=true \
+  scripts/run_benchmark_ns_per_day.sh
+sbatch --export=ALL,MODEL=platoformer,COMPILE=true,CUDNN_BENCH=true \
+  scripts/run_benchmark_ns_per_day.sh
+```
+
+`torch.compile` adds ~5-10 min of first-call inductor codegen but cuts ms/step
+roughly 1.4-1.7× on both eSEN and PT recipes.
+
+**Reference results** (single H100, N=1000 atoms, single-system mode, fp32 + TF32,
+forward-only, dt=1 fs):
+
+| Recipe | Params | ms/step | ns/day | atom-ns/day | Notes |
+|---|---|---|---|---|---|
+| PT eager (`MODEL=platoformer`) | 18.2M | 24.7 | 3.49 | 3.5e3 | flash attention |
+| **PT compiled** | 18.2M | **17.31** | **4.99** | 5.0e3 | + cudnn.benchmark; 1.43× over eager |
+| eSEN Ngo default (`MODEL=esen`, sphere=32, lmax=4, L=12, conservative) | 3.4M | 140.0 | 0.62 | 6.2e2 | tiny baseline; misconfigured arch |
+| eSEN paper-sized conservative (`esen_paper` w/ `direct_forces=false`) eager | 6.07M | 70.9 | 1.22 | 1.2e3 | matches HF eSEN-sm width/depth |
+| eSEN paper-sized conservative compiled (AC=off, cudnn.bench) | 6.07M | 42.35 | 2.04 | 2.0e3 | 1.67× over eager; autograd.grad path partially compiled |
+| **eSEN paper-sized direct + compile** (AC=off, cudnn.bench) | 6.04M | **17.07** | **5.06** | 5.1e3 | direct forces remove the autograd-grad in inference too |
+
+For context, the published AllScAIP numbers (H200, also single-system) put:
+- AllScAIP-sm 35M at 2.279 ns/day, AllScAIP-md 85M at 1.124 ns/day (Table 2)
+- eSEN-sm 6M direct at ~3 ns/day (Figure 5, visual read; H200 → ~+30% over H100 for eSCN-style)
+
+After H100→H200 adjustment (~no boost for attention models, ~+30% for eSCN/eSEN),
+**both our compiled PT and our compiled eSEN-sm-direct land near 5 ns/day H100**,
+≈ 5.0 / ≈ 6.6 ns/day H200-equivalent. PT is **~2× the published AllScAIP-sm**
+at half the parameter count; eSEN-sm-direct is **~2× the published eSEN-sm**
+at the same parameter count (within the small 6.04M vs 6.33M mismatch and
+measurement noise). The published number is plausibly graph-gen-included while
+ours subtracts it via `compile=true` warmup.
+
+Notes:
+- PT's `torch.compile` reports a graph break inside the flash-attn dispatch
+  (`batch.max().item()` in `conv.py`). Speedup is still ~1.4×; if you want to
+  squeeze more, try launching with `TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1`.
+- eSEN-direct's first compile run is slow (~10-15 min inductor codegen on the
+  first forward) because there is no `autograd.grad` graph break, so the whole
+  backbone + dual heads compile as one graph. Subsequent calls hit the inductor
+  cache and start in seconds.
+
+## Repository structure
+
+```
+platonic-omol/
+├── training/                   # Training code
+│   ├── train_omol.py           # Hydra entry point
+│   ├── nets/platoformer/       # PlatoFormer model (ported from niazoys/PlatonicTransformers)
+│   ├── src/                    # Lightning datamodule + module
+│   ├── configs/                # Hydra configs
+│   └── utils/                  # Logging utilities
+├── scripts/                    # SLURM launch scripts (one per recipe)
+├── eval/                       # Leaderboard submission tools
+├── requirements.txt
+└── README.md
+```
+
+## Model
+
+The Platonic Transformer is a group-equivariant transformer that uses Rotary Position Embeddings (RoPE) on the symmetry group of a Platonic solid. Key features:
+
+- **Tetrahedral equivariance** (|G|=12): encodes 3D rotational symmetry via the chiral tetrahedral group
+- **RoPE on values** (GTA Eq. 5): applies positional rotations to values and inverse-rotates the output
+- **ScheduleFree optimizer** with r=2.0
+- **O(3) data augmentation** (random rotations + reflections)
+- **Charge/spin conditioning** (additive injection, following eSEN/UMA): random Fourier features over (charge, spin), Linear+SiLU mix, added to atom embedding
+- **eSEN-aligned normalization**: target = (energy - element_refs) / 1.433569 (mean=0 enforced; rmsd is eSEN's published OMol-4M value)
+
+See [ebekkers/platonic-scaling-laws](https://github.com/ebekkers/platonic-scaling-laws) for the scaling-laws analysis and [niazoys/PlatonicTransformers](https://github.com/niazoys/PlatonicTransformers) for the base PlatoFormer implementation.
+
+See [PROGRESS.md](PROGRESS.md) for detailed progress tracking.
+
+## Leaderboard
+
+Reference baselines on OMol25-4M val (80 epochs, from AllScAIP paper Table 4):
+- eSEN-md-d.       — E-MAE 1.32 meV/atom, F-MAE 6.78 meV/Å
+- AllScAIP-md-d.   — E-MAE 1.04 meV/atom, F-MAE 8.19 meV/Å
+- AllScAIP-md-ft-cons. — E-MAE 0.90 meV/atom, F-MAE 7.67 meV/Å (50 ep direct + 30 ep conservative fine-tune)
+
+## wandb
+
+Experiments tracked at [erikjbekkers/scaling-laws-symmetry](https://wandb.ai/erikjbekkers/scaling-laws-symmetry), group `platonic-omol` (or sub-groups per experiment series).
+
+## Related
+
+- [ebekkers/platonic-scaling-laws](https://github.com/ebekkers/platonic-scaling-laws) — Scaling-laws paper and experiments
+- [niazoys/PlatonicTransformers](https://github.com/niazoys/PlatonicTransformers) — PlatoFormer base implementation
+- [facebookresearch/fairchem](https://github.com/facebookresearch/fairchem) — FAIR Chemistry (OMol25 dataset, eSEN/UMA baselines)
+- AllScAIP paper: arXiv:2603.06567 (FAIR, March 2026)

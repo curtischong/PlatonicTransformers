@@ -1,0 +1,96 @@
+_target_: src.model.omol_module.GraphModel
+
+# eSEN-sm: paper-matching configuration for training-from-scratch comparison.
+#
+# Hyperparameters read directly from the released checkpoint
+#   facebook/OMol25/checkpoints/esen_sm_direct_all.pt   (6,333,093 params)
+# via `torch.load(...).model_config["backbone"]`. The 3 architectural knobs
+# that dominate compute and parameter count (sphere_channels, lmax, num_layers)
+# are matched exactly; the remaining backbone knobs are left at the values
+# from our esen.yaml (originally forked from platonic-scaling-laws) since
+# they do not appear in the published backbone config dict.
+#
+# With these settings our config measures 6,070,113 params (4% below the
+# 6.33M target — small mismatch attributable to non-architectural knobs
+# like ff_type, edge_channels, num_distance_basis, head structure).
+#
+# Throughput at N=1000 atoms, single H100, fp32 + TF32:
+#   eager + activation_checkpointing=true : 70.88 ms/step → 1.22 ns/day
+#   torch.compile + AC=false + cudnn.bench: 42.35 ms/step → 2.04 ns/day
+# H200-adjusted compiled number ≈ 2.65 ns/day vs paper's eSEN-sm at ≈ 3.
+net:
+  _target_: nets.uma.model.EquivariantNet
+  max_num_elements: 100
+  # Paper eSEN-sm: sphere/hidden=128, lmax=2.
+  sphere_channels: 128
+  hidden_channels: 128
+  lmax: 2
+  mmax: 2
+  grid_resolution: null
+  num_sphere_samples: 128
+  otf_graph: true
+  max_neighbors: 30
+  cutoff: 6.0
+  edge_channels: 8
+  distance_function: gaussian
+  num_distance_basis: 136
+  # Direct force prediction (matches the "filled-circle direct" eSEN baselines
+  # in AllScAIP Figure 5 — what we are actually comparing against). Conservative
+  # (direct_forces=false) requires autograd.grad through the energy, which makes
+  # training double-backward — ~3× the activation memory of direct prediction
+  # and incompatible with torch.compile's donated-buffer optimization.
+  direct_forces: true
+  regress_forces: true
+  regress_stress: false
+  # Paper eSEN-sm: 5 blocks (vs 12 in the Ngo & Ravanbakhsh default fork).
+  num_layers: 5
+  norm_type: rms_norm_sh
+  act_type: gate
+  ff_type: grid
+  # Activation checkpointing trades compute for memory. Leave on for training
+  # (backward pass is the memory bottleneck); turn off for inference benchmarks
+  # via Hydra override (force_field_module.net.activation_checkpointing=false).
+  activation_checkpointing: true
+  chg_spin_emb_type: pos_emb
+  cs_emb_grad: false
+  dataset_emb_grad: false
+  dataset_list: null
+  use_dataset_embedding: false
+  use_cuda_graph_wigner: false
+  radius_pbc_version: 1
+  always_use_pbc: false
+  use_pbc: false
+  use_pbc_single: false
+  avg_num_nodes: 26.5
+
+base_net: null
+
+optimizer:
+  lr: 5e-4
+  lr_min: 1e-6
+  name: adamw
+  weight_decay: 1e-5
+  e_loss_name: per_atom_mae
+  f_loss_name: l2norm
+  e_weight: 10
+  f_weight: 10
+  amsgrad: false
+  # 1% fractional warmup, cosine to lr_min. Matches PT 20ep recipe.
+  scheduler_name: cosine_annealing_ws
+  T_max: 1
+  num_warmup_steps: 0.01
+  e_weight_warmup_steps: 0
+  num_restarts: 10
+
+# eSEN is fully equivariant — no O(3) augmentation needed (rotations cost nothing).
+train_augmentation: false
+# torch.compile gives ~1.67× speedup on this config in our inference benchmark;
+# for training, the omol_module compile hook fires on stage=="fit" when this is true.
+compile: true
+compile_mode: default
+compile_dynamic: null
+reference_path: configs/constants/element_refs.yaml
+
+train_mean: 0.0
+train_rmsd: 1.433569
+flops_coef: 240

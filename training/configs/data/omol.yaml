@@ -1,0 +1,15 @@
+datamodule:
+  _target_: src.data.omol_module.OMolModule
+
+  data:  
+    train_data_path: ${oc.env:DATA_PATH}/open_mol/neutral_train
+    val_data_path: ${oc.env:DATA_PATH}/open_mol/neutral_val
+    pin_memory: True
+    num_workers: 7
+    seed: 1
+    val_ratio: 0.001
+    shuffle: False
+
+  batch_size: 
+    train: 64
+    val: 64

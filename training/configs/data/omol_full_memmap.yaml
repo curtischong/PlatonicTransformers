@@ -1,0 +1,24 @@
+datamodule:
+  _target_: src.data.omol_memmap_module.OMolMemmapModule
+  validation_mode: heldout
+  precompute_reference_energy: true
+  reference_path: configs/constants/element_refs.yaml
+
+  data:
+    train_data_path: ${oc.env:DATA_PATH}/open_mol_memmap/train
+    val_data_path: ${oc.env:DATA_PATH}/open_mol_memmap/val
+    pin_memory: True
+    num_workers: 16
+    seed: 42
+    train_size: 0.9
+    shuffle: True
+
+  batch_size:
+    train: 64
+    val: 64
+
+  dynamic_batching: true
+  max_atoms_per_batch: 6000
+  max_atoms_per_batch_val: 6000
+  prefetch_factor: 2
+  debug_subset: null

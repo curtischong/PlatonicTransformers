@@ -1,0 +1,73 @@
+_target_: src.model.omol_module.GraphModel
+
+# eSEN (Smooth Energy Network): fairchem's eSCN-MD backbone with
+# autograd-derived (conservative) forces. Small-config defaults mirroring the
+# uma.yaml stub from platonic-scaling-laws (sphere=hidden=32, lmax=4, 12 layers).
+net:
+  _target_: nets.uma.model.EquivariantNet
+  max_num_elements: 100
+  sphere_channels: 32
+  lmax: 4
+  mmax: 2
+  grid_resolution: null
+  num_sphere_samples: 128
+  otf_graph: true
+  max_neighbors: 30
+  cutoff: 6.0
+  edge_channels: 8
+  distance_function: gaussian
+  num_distance_basis: 136
+  # eSEN: smooth energy → forces via autograd from energy (conservative).
+  direct_forces: false
+  regress_forces: true
+  regress_stress: false
+  num_layers: 12
+  hidden_channels: 32
+  norm_type: rms_norm_sh
+  act_type: gate
+  ff_type: grid
+  # Activation checkpointing trades compute for memory. eSEN's per-edge SH
+  # convolutions are memory-heavy; this is roughly free on H100 given that
+  # the bottleneck is memory bandwidth, not FLOPs.
+  activation_checkpointing: true
+  chg_spin_emb_type: pos_emb
+  cs_emb_grad: false
+  dataset_emb_grad: false
+  dataset_list: null
+  use_dataset_embedding: false
+  use_cuda_graph_wigner: false
+  radius_pbc_version: 1
+  always_use_pbc: false
+  use_pbc: false
+  use_pbc_single: false
+  avg_num_nodes: 26.5
+
+base_net: null
+
+optimizer:
+  lr: 5e-4
+  lr_min: 1e-6
+  name: adamw
+  weight_decay: 1e-5
+  e_loss_name: per_atom_mae
+  f_loss_name: l2norm
+  e_weight: 10
+  f_weight: 10
+  amsgrad: false
+  # 1% fractional warmup, cosine to lr_min. Matches PT 20ep recipe.
+  scheduler_name: cosine_annealing_ws
+  T_max: 1
+  num_warmup_steps: 0.01
+  e_weight_warmup_steps: 0
+  num_restarts: 10
+
+# eSEN is fully equivariant — no O(3) augmentation needed (rotations cost nothing).
+train_augmentation: false
+compile: false
+compile_mode: default
+compile_dynamic: null
+reference_path: configs/constants/element_refs.yaml
+
+train_mean: 0.0
+train_rmsd: 1.433569
+flops_coef: 240

@@ -1,0 +1,17 @@
+# @package _global_
+# Reference fp32 preset, used for the original sig4-wd1e4-dyn baseline. Keeps TF32
+# on for matmul (essentially free accuracy, large speedup on H100), but no autocast.
+# torch.compile off — the diagnostic showed it wasn't delivering speedup on the fp32
+# path anyway, and turning it off avoids the recompile noise in eager runs.
+
+trainer:
+  precision: 32-true
+
+matmul_precision: high
+cudnn_benchmark: false
+cudnn_deterministic: true
+
+force_field_module:
+  compile: false
+  compile_dynamic: null
+  compile_mode: default

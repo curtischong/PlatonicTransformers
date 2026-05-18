@@ -1,0 +1,91 @@
+_target_: src.model.omol_module.GraphModel
+
+net:
+  _target_: nets.platoformer.model.PlatonicForceField
+  max_num_elements: 100
+  hidden_dim: 192           # d_model = |G| * d_head * H. Must be divisible by |G|.
+  nhead: 12                 # H heads per group element * |G|. Must be divisible by |G|.
+  num_layers: 9
+  solid_name: tetrahedron   # "trivial" for |G|=1, "tetrahedron" for |G|=12, "octahedron" for |G|=24
+  ffn_dim_factor: 4
+  dropout: 0.0
+  rope_sigma: 1.0
+  learned_freqs: True
+  dense_mode: True
+  embed_init_std: null
+  layer_scale_init_value: null
+  attention: true
+  avg_num_nodes: 26.5
+  activation: gelu
+  atom_embed: learned   # "learned" (nn.Embedding) or "khot" (fixed K-HOT + linear projection)
+  drop_path_rate: 0.0
+  freq_init: random   # "random" (gaussian with rope_sigma std) or "spiral" (golden angle)
+  attention_backend: scatter   # "scatter" (default) or "flash" (requires flash-attn)
+  qk_norm: false   # RMSNorm on Q and K (head_dim) before RoPE — LLaMA-3 style
+  swiglu: false    # Gated FFN: silu(W_gate(x)) * W_up(x) → linear2 (LLaMA style)
+  use_key: false   # When false (and RoPE on), k=1 (constant) and RoPE provides the only relative-key signal
+  norm_type: layernorm   # "layernorm" (default, uses apex FusedLayerNorm if available) or "rmsnorm"
+  # Charge/Spin: eSEN recipe — pos_emb x2 + Linear+SiLU mix, injected at input only.
+  # mode: "off" (no conditioning), "add" (sum into atom emb), or "concat" (concat onto atom emb)
+  chgspin_mode: off
+  chgspin_emb_dim: null   # pos_emb size; null → embed_dim = hidden_dim / |G|
+  # Init std of the chgspin_mix Linear weights. 0.02 (eSEN-default) makes the
+  # post-SiLU signal ~1.4× the atom embedding init magnitude; 0.014 brings them
+  # to parity (target std(mixed) ≈ std(atom_emb) = 1/sqrt(embed_dim)).
+  chgspin_mix_init_std: 0.02
+  # Per-block additive injection (replicates the mixed signal across G and adds
+  # it before every block). chgspin_layerwise_gate adds a learnable per-block
+  # scalar γ_chgspin (init = layer_scale_init_value) so the per-block magnitude
+  # matches one block's attention contribution at init.
+  chgspin_layerwise: false
+  chgspin_layerwise_gate: false
+  # Per-block FiLM modulation: x → (1+γ_c)·x + β_c, with γ_c, β_c produced by
+  # zero-init per-block Linear(embed_dim→2·embed_dim). Identity at init.
+  # Mutually exclusive with chgspin_layerwise.
+  chgspin_film: false
+  # Radius graph (sparse attention) — when set (recommended starting value: 2.0 Å),
+  # each forward builds radius_graph(pos, r) once and reuses it across blocks. A
+  # Klicpera polynomial cutoff smooths the boundary. null → dense within-graph
+  # attention (current default). Requires dense_mode=false. Without local_global
+  # it also requires attention_backend=scatter (a single sparse stream); with
+  # local_global=true, flash stays usable for the global sub-blocks.
+  interaction_radius: null
+  cutoff_p: 6
+  max_num_neighbors: 1000
+  # Dual-stage local→global blocks (AllScAIP-style). When true each logical
+  # layer expands into a (local, global) pair of PlatonicBlocks — ~2× params
+  # and FLOPs at the same num_layers. Requires interaction_radius to be set.
+  # Local sub-blocks force the scatter backend; global sub-blocks use
+  # attention_backend (flash when configured).
+  local_global: false
+
+base_net: null  # Set via Hydra override to enable muP (e.g. force_field_module.base_net._target_=nets.platoformer.model.PlatonicForceField ...)
+
+optimizer:
+  lr: 5e-4
+  lr_min: 1e-6
+  name: free
+  weight_decay: 0.0
+  e_loss_name: per_atom_mae
+  f_loss_name: l2norm
+  e_weight: 10
+  f_weight: 10
+  amsgrad: False
+  scheduler_name: cosine_annealing
+  T_max: 1
+  num_warmup_steps: 100
+  e_weight_warmup_steps: 0
+  num_restarts: 10
+
+train_augmentation: False
+compile: False
+compile_mode: default        # default | reduce-overhead | max-autotune
+compile_dynamic: null        # null = automatic, true = force dynamic shapes, false = static
+reference_path: configs/constants/element_refs.yaml
+
+# eSEN-style normalization: train_mean fixed at 0 (element refs absorb the
+# per-atom mean), train_rmsd = sqrt(mean(y^2)) of (energy - refs), shared
+# between energy and forces. Set to null to auto-estimate at training start.
+train_mean: 0.0
+train_rmsd: null
+flops_coef: 6    # standard 6ND approximation for transformers
