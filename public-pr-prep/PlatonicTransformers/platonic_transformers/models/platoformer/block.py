@@ -123,8 +123,11 @@ class PlatonicBlock(nn.Module):
         use_key: bool = False,
         rope_on_values: bool = False,
         attention_backend: str = "scatter",
+        qk_norm: bool = False,
+        swiglu: bool = False,
     ) -> None:
         super().__init__()
+        self.swiglu = swiglu
 
         # --- Group and Dimension Setup ---
         self.group = PLATONIC_GROUPS[solid_name.lower()]
@@ -157,10 +160,21 @@ class PlatonicBlock(nn.Module):
             use_key=use_key,
             rope_on_values=rope_on_values,
             attention_backend=attention_backend,
+            qk_norm=qk_norm,
         )
 
-        # Equivariant Feed-Forward Network
-        self.linear1 = PlatonicLinear(d_model, dim_feedforward, solid=solid_name)
+        # Equivariant Feed-Forward Network. When swiglu=True, replace the
+        # standard linear1→activation→linear2 with a gated MLP:
+        #     out = linear2( silu(linear1_gate(x)) * linear1_up(x) )
+        # Both branches go d_model→dim_feedforward via PlatonicLinear, so
+        # equivariance is preserved (elementwise product commutes with the
+        # group action). Param count is +50% over the standard FFN at the
+        # same dim_feedforward — matching LLaMA's SwiGLU convention.
+        if swiglu:
+            self.linear1_gate = PlatonicLinear(d_model, dim_feedforward, solid=solid_name)
+            self.linear1_up = PlatonicLinear(d_model, dim_feedforward, solid=solid_name)
+        else:
+            self.linear1 = PlatonicLinear(d_model, dim_feedforward, solid=solid_name)
         self.linear2 = PlatonicLinear(dim_feedforward, d_model, solid=solid_name)
 
         # Normalization (acts on the per-group-element channel dimension)
@@ -243,5 +257,9 @@ class PlatonicBlock(nn.Module):
 
     def _ff_block(self, x: Tensor) -> Tensor:
         """Equivariant Feed-Forward Network block."""
-        ff_output = self.linear2(self.ffn_dropout(self.activation(self.linear1(x))))
+        if self.swiglu:
+            h = F.silu(self.linear1_gate(x)) * self.linear1_up(x)
+        else:
+            h = self.activation(self.linear1(x))
+        ff_output = self.linear2(self.ffn_dropout(h))
         return self.dropout2(ff_output)

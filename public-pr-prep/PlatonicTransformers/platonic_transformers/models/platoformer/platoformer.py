@@ -72,6 +72,8 @@ class PlatonicTransformer(nn.Module):
         use_key: bool = False,
         rope_on_values: bool = False,
         attention_backend: str = "scatter",  # "scatter" | "flash"
+        qk_norm: bool = False,
+        swiglu: bool = False,
         activation: str = "gelu",
         # In-model patchification: learnable Platonic EdgeConv (FPS centers
         # + KNN + per-edge MLP + max-pool). When off, callers are expected
@@ -85,7 +87,7 @@ class PlatonicTransformer(nn.Module):
         super().__init__()
 
         # Resolve activation function from string
-        _activations = {"gelu": F.gelu, "silu": F.silu, "relu": F.relu, "mish": F.mish}
+        _activations = {"gelu": F.gelu, "silu": F.silu, "relu": F.relu, "mish": F.mish, "sin": torch.sin}
         if activation not in _activations:
             raise ValueError(f"Unknown activation '{activation}'. Choose from {list(_activations.keys())}")
         _activation_fn = _activations[activation]
@@ -161,6 +163,8 @@ class PlatonicTransformer(nn.Module):
                 use_key=use_key,
                 rope_on_values=rope_on_values,
                 attention_backend=attention_backend,
+                qk_norm=qk_norm,
+                swiglu=swiglu,
             ))
 
         readout_solid = f"trivial_{spatial_dim}" if trivial_readout else solid_name

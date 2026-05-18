@@ -79,6 +79,7 @@ class PlatonicConv(nn.Module):
         use_key: bool = False,
         rope_on_values: bool = False,
         attention_backend: str = "scatter",
+        qk_norm: bool = False,
     ):
         super().__init__()
 
@@ -146,6 +147,17 @@ class PlatonicConv(nn.Module):
         else:
             self.register_buffer('rope_emb', None)
 
+        # Optional QK-norm: RMSNorm on Q and K independently, applied after
+        # projection (and before RoPE) — LLaMA-3 style. The norm operates on
+        # the head_dim axis with γ of shape (head_dim,), shared across the G
+        # axis so the operation commutes with the Platonic group action.
+        if qk_norm:
+            self.q_norm = nn.RMSNorm(self.head_dim)
+            self.k_norm = nn.RMSNorm(self.head_dim)
+        else:
+            self.q_norm = nn.Identity()
+            self.k_norm = nn.Identity()
+
         # Final equivariant linear layer
         self.out_proj = PlatonicLinear(embed_dim, out_channels, solid_name, bias=bias)
     
@@ -162,6 +174,11 @@ class PlatonicConv(nn.Module):
         q = q_raw.view(*leading_dims, self.num_G, self.effective_num_heads, self.head_dim)
         v = v_raw.view(*leading_dims, self.num_G, self.effective_num_heads, self.head_dim)
         k = k_raw.view(*leading_dims, self.num_G, self.effective_num_heads, self.head_dim)
+
+        # QK-norm (RMSNorm on head_dim) — applied before RoPE so the rotation
+        # acts on already-normalized vectors. Identity when qk_norm=False.
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         # Apply RoPE to query and key (and optionally value, per GTA Eq. 5)
         if self.rope_emb is not None:
