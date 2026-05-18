@@ -1,77 +1,107 @@
-# OMol Energy and Force Prediction Configuration
+# OMol25 Energy + Force Prediction — winning Platonic recipe defaults.
+#
+# This config reproduces the "qcczbpfn" winning recipe at our Snellius/hipster
+# evaluations: nh=12, h=1920, L=16, GeLU-MLP FFN with sin activation, LayerScale
+# at 1e-4, charge/spin FiLM conditioning, EMA 0.99, weight_decay 1e-8.
+#
+# To reproduce eSEN baseline instead, override `model.name=esen` and select the
+# eSEN-small recipe in `configs/omol_esen.yaml` (use `--config` override).
 
-seed: 42
+seed: 1
 
 # Dataset configuration
 dataset:
   name: "omol"
-  data_dir: "/opt/datasets/ivi/ivi_omol"
-  split: "main_split" 
+  data_dir: "/opt/datasets/ivi/ivi_omol"   # adjust to your cluster's OMol25 location
+  split: "main_split"
   num_workers_preload: 8
   preload_data: true
-  scalar_features: []  # Additional scalar features, e.g., ["coords", "charges"]
-  vector_features: []  # Additional vector features, e.g., ["coords"]
-  debug_subset: null  # Use a subset for debugging (e.g., 1000)
-  referencing: true  # Use per-atom referencing for target energy
-  include_hof: false  # Normalize target using HOF values
-  scale_shift: false  # Use scale and shift normalization
-  recalculate_stats: false  # Recalculate dataset statistics
-  use_khot_encoding: true  # Use k-hot encoding for atom types
-  
-# Model architecture
+  scalar_features: []  # ["coords", "charges"] to include them as input channels
+  vector_features: []
+  debug_subset: null
+  referencing: true                         # subtract per-element ref energies
+  include_hof: false
+  scale_shift: false
+  recalculate_stats: false
+  use_khot_encoding: true
+  # Path (relative to repo root) to YAML with `oc20_elem_refs:` — per-Z reference
+  # energies. Subtracted from target energy in training/val/test for a flatter
+  # regression target. Set to null to disable.
+  element_refs_path: "configs/constants/element_refs.yaml"
+
+# Model architecture — winning recipe
 model:
-  name: "platoformer"
-  hidden_dim: 1152
-  num_layers: 14
-  num_heads: 72
-  solid_name: "tetrahedron"  # Options: tetrahedron, trivial_3, octahedron, icosahedron
+  name: "platoformer"                       # "platoformer" or "esen" (see omol_esen.yaml)
+  hidden_dim: 1920
+  num_layers: 16
+  num_heads: 12                             # nh=12 = G; head_dim = 1920/12 = 160
+  solid_name: "tetrahedron"                 # |G| = 12
   spatial_dim: 3
-  dense_mode: false
-  predict_forces: true  # If true, direct force prediction; if false, forces from energy gradient
-  
-  # Task configuration (dynamically set based on predict_forces)
+  dense_mode: false                         # graph mode (PyG batching)
+  predict_forces: false                     # forces via autograd of energy (conservative)
+
   scalar_task_level: "graph"
-  vector_task_level: "node"  
+  vector_task_level: "node"
   ffn_readout: true
-  
-  # Attention settings
+
+  # Attention
   mean_aggregation: false
   attention: true
   dropout: 0.0
   drop_path_rate: 0.0
-  layer_scale_init_value: null
+  layer_scale_init_value: 1.0e-4            # LayerScale ON
   ffn_dim_factor: 4
-  
-  # Positional encoding
-  rope_sigma: 4.0
+
+  # RoPE / positional encoding
+  rope_sigma: 2.0
   ape_sigma: null
   learned_freqs: true
-  freq_init: "random"  # Options: "random", "spiral"
-  use_key: false
+  freq_init: "random"
+  rope_on_values: true                      # GTA-style: rotate V too, un-rotate output
+  use_key: true
 
-# Training configuration
+  # Hardening flags (LLaMA-3 style)
+  qk_norm: true                             # RMSNorm on Q and K (head_dim)
+  swiglu: false                             # GeLU-MLP FFN (paired with LayerScale ON)
+  activation: "sin"                         # sin FFN activation
+  attention_backend: "flash"                # falls back to scatter if flash-attn missing
+
+  # Charge/spin conditioning (OMol25 specific)
+  chgspin_mode: "off"                       # "off" or "add" (input-side, not yet wired)
+  chgspin_film: true                        # per-block FiLM modulation (identity at init)
+  chgspin_embed_dim: null                   # null → hidden_dim / |G| = 160
+  chgspin_mix_init_std: 0.02
+
+# Training
 training:
-  epochs: 40
-  batch_size: 32
+  epochs: 20
+  batch_size: 32                            # NOTE: original used dynamic batching with
+                                            # max_atoms_per_batch=12000 (effective batch
+                                            # of ~450 molecules). Fixed batch=32 here is
+                                            # a memory-safe approximation. To exactly
+                                            # reproduce, port the DynamicBatchSampler
+                                            # from the private platonic-omol repo.
   gradient_clip_val: 1.0
-  train_augm: true  # Rotation augmentation
-  lambda_F: 5.0  # Weight for force loss
+  train_augm: true                          # SO(3) rotation augmentation
+  lambda_F: 20.0                            # force-loss weight (= F_WEIGHT in private)
 
-# Optimizer configuration
+# Optimizer
 optimizer:
   name: "adamw"
-  lr: 2.0e-4
-  weight_decay: 1.0e-6
-  ema: false  # Exponential moving average
-  ema_decay: 0.999
+  lr: 5.0e-4
+  weight_decay: 1.0e-8                      # NOTE: very small wd, paired with GeLU+sin
+  ema: true                                 # exponential moving average of weights
+  ema_decay: 0.99                           # winning-recipe value (EMA wiring is a
+                                            # one-line addition with a Lightning callback
+                                            # like `ema_pytorch.EMA` — see README)
 
-# Scheduler configuration
+# Scheduler
 scheduler:
   name: "cosine"
   warmup_epochs: 0
   use_cosine: true
 
-# Logging configuration
+# Logging
 logging:
   enabled: true
   project_name: "Platonic-OMol"
@@ -79,19 +109,18 @@ logging:
   wandb_identity: null
   log_every_n_steps: 50
 
-# System configuration
+# System
 system:
   gpus: 1
   num_workers: 0
   enable_progress_bar: true
   accumulate_grad_batches: 1
-  strategy: "auto"  # "ddp" for multi-GPU
-  precision: "32"  # Options: "16-mixed", "bf16-mixed", "32"
-  timer: null  # Timer for training, e.g., "00:08:00:00"
+  strategy: "auto"
+  precision: "32"
+  timer: null
 
 # Testing/checkpointing
 testing:
   test_ckpt: null
   resume_ckpt: null
-  load_weights: null  # Path to load model weights from for a new run
-
+  load_weights: null

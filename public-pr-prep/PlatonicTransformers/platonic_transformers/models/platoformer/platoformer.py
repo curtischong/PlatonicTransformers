@@ -74,6 +74,14 @@ class PlatonicTransformer(nn.Module):
         attention_backend: str = "scatter",  # "scatter" | "flash"
         qk_norm: bool = False,
         swiglu: bool = False,
+        # OMol25 charge/spin conditioning via per-block FiLM. When True, the
+        # forward pass accepts a per-node `chgspin_mixed_per_node` tensor
+        # (shape [N, chgspin_embed_dim]) and applies
+        #     x ← (1 + γ_block(chgspin)) · x + β_block(chgspin)
+        # before each PlatonicBlock. γ/β are produced by a zero-init Linear
+        # so FiLM is identity at init.
+        chgspin_film: bool = False,
+        chgspin_embed_dim: Optional[int] = None,
         activation: str = "gelu",
         # In-model patchification: learnable Platonic EdgeConv (FPS centers
         # + KNN + per-edge MLP + max-pool). When off, callers are expected
@@ -167,6 +175,25 @@ class PlatonicTransformer(nn.Module):
                 swiglu=swiglu,
             ))
 
+        # --- Charge/Spin FiLM projections (one Linear per block, zero-init) ---
+        # Each Linear maps the per-node chgspin embedding → (γ, β) for that
+        # block. Zero-init weights + bias so FiLM = identity at start; the
+        # model learns the modulation through gradient descent. The output
+        # is in per-G-slot space (chgspin_embed_dim per slot); _lift_invariant
+        # replicates it across G so the operation commutes with the group action.
+        self.chgspin_film = chgspin_film
+        self.chgspin_embed_dim = chgspin_embed_dim
+        if chgspin_film:
+            if chgspin_embed_dim is None:
+                raise ValueError("chgspin_film=True requires chgspin_embed_dim.")
+            self.film_projs = nn.ModuleList([
+                nn.Linear(chgspin_embed_dim, 2 * chgspin_embed_dim)
+                for _ in range(num_layers)
+            ])
+            for proj in self.film_projs:
+                nn.init.zeros_(proj.weight)
+                nn.init.zeros_(proj.bias)
+
         readout_solid = f"trivial_{spatial_dim}" if trivial_readout else solid_name
         readout_G = 1 if trivial_readout else self.num_G
         if ffn_readout:
@@ -184,13 +211,25 @@ class PlatonicTransformer(nn.Module):
             self.scalar_readout = PlatonicLinear(self.hidden_dim, readout_G * output_dim, readout_solid)
             self.vector_readout = PlatonicLinear(self.hidden_dim, readout_G * output_dim_vec * spatial_dim, readout_solid)
 
+    def _lift_invariant(self, token: Tensor) -> Tensor:
+        """Replicate a per-G-slot signal (..., embed_dim) across G to (..., G*embed_dim).
+        Group-invariant lift: identical value in every G slot, so it commutes with the
+        group action that permutes the G axis (matches the PlatonicBlock storage layout).
+        """
+        embed_dim = token.shape[-1]
+        expanded = list(token.shape[:-1]) + [self.num_G, embed_dim]
+        return token.unsqueeze(-2).expand(expanded).reshape(
+            *token.shape[:-1], self.num_G * embed_dim
+        )
+
     def forward(self,
                 x: Tensor,
                 pos: Tensor,
                 batch: Optional[torch.Tensor] = None,
                 mask: Optional[Tensor] = None,
                 vec: Optional[Tensor] = None,
-                avg_num_nodes: float = 1.0) -> Tensor:
+                avg_num_nodes: float = 1.0,
+                chgspin_mixed_per_node: Optional[Tensor] = None) -> Tensor:
         """
         Args:
             x: Node scalar features `(N, input_dim)` or `None`.
@@ -207,8 +246,15 @@ class PlatonicTransformer(nn.Module):
         # mask/batch is non-None depending on the patchifier's output format.
         x, pos, mask, batch = self.patchifier(x, vec, pos, batch)
 
-        # 2. Equivariant Encoder
-        for layer in self.layers:
+        # 2. Equivariant Encoder. With chgspin_film, apply per-block FiLM
+        # x ← (1 + γ_block(chgspin)) · x + β_block(chgspin) before each block,
+        # using γ/β produced by a zero-init Linear on the per-node chgspin
+        # signal (identity at init). γ, β are lifted group-invariantly across G.
+        for i, layer in enumerate(self.layers):
+            if self.chgspin_film and chgspin_mixed_per_node is not None:
+                film_out = self.film_projs[i](chgspin_mixed_per_node)
+                gamma_c, beta_c = film_out.chunk(2, dim=-1)
+                x = (1 + self._lift_invariant(gamma_c)) * x + self._lift_invariant(beta_c)
             x = layer(x=x, pos=pos, batch=batch, mask=mask,
                       avg_num_nodes=avg_num_nodes)
 

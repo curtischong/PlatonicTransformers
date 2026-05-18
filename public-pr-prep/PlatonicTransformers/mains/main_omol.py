@@ -15,9 +15,12 @@ from pytorch_lightning.callbacks import Timer
 from pytorch_lightning.strategies import DDPStrategy
 from torch_geometric.data import Data
 
+import yaml
+
 from platonic_transformers.datasets.omol import get_omol_loaders
 from platonic_transformers.models.platoformer.platoformer import PlatonicTransformer
 from platonic_transformers.models.platoformer.groups import PLATONIC_GROUPS
+from platonic_transformers.models.platoformer.chg_spin_emb import ChgSpinEmbedding
 from platonic_transformers.utils.config_loader import (
     get_arg_parser,
     load_with_defaults,
@@ -49,6 +52,59 @@ class OMolModel(pl.LightningModule):
             + 1 * ("charges" in self.config.dataset.scalar_features)  # charges as scalars
         )
         in_channels_vector = 0  # No vector features used in this setup
+
+        # --- OMol25 charge/spin embeddings (random Fourier features + Linear+SiLU mix) ---
+        # When config.model.chgspin_mode != "off", build per-atom charge AND spin
+        # RFF embeddings (ChgSpinEmbedding, pos_emb variant), concat them, and
+        # mix through a single Linear + SiLU to produce a per-node conditioning
+        # signal `chgspin_mixed`. This signal is then used by per-block FiLM
+        # (when config.model.chgspin_film=True) inside PlatonicTransformer.
+        chgspin_mode = getattr(self.config.model, "chgspin_mode", "off")
+        chgspin_film = bool(getattr(self.config.model, "chgspin_film", False))
+        # Per-G-slot embedding dim — defaults to hidden_dim // |G| if unset.
+        num_G = PLATONIC_GROUPS[self.config.model.solid_name.lower()].G
+        chgspin_embed_dim = getattr(self.config.model, "chgspin_embed_dim", None)
+        if chgspin_embed_dim is None:
+            chgspin_embed_dim = self.config.model.hidden_dim // num_G
+        self.chgspin_mode = chgspin_mode
+        self.chgspin_film_enabled = chgspin_film
+        self.chgspin_embed_dim = chgspin_embed_dim
+        needs_chgspin = (chgspin_mode != "off") or chgspin_film
+        if needs_chgspin:
+            self.charge_embedder = ChgSpinEmbedding(
+                embedding_type="pos_emb", embedding_target="charge",
+                embedding_size=chgspin_embed_dim,
+            )
+            self.spin_embedder = ChgSpinEmbedding(
+                embedding_type="pos_emb", embedding_target="spin",
+                embedding_size=chgspin_embed_dim,
+            )
+            mix_init_std = float(getattr(
+                self.config.model, "chgspin_mix_init_std", 0.02))
+            self.chgspin_mix = torch.nn.Linear(2 * chgspin_embed_dim, chgspin_embed_dim)
+            torch.nn.init.normal_(self.chgspin_mix.weight, std=mix_init_std)
+            torch.nn.init.constant_(self.chgspin_mix.bias, 0.0)
+        else:
+            self.charge_embedder = None
+            self.spin_embedder = None
+            self.chgspin_mix = None
+
+        # --- Per-element reference energy subtraction (OC20 OMol25 refs) ---
+        # When config.dataset.referencing=True and a path is provided, load the
+        # per-Z reference energies and register as a non-trainable buffer.
+        # In training/val/test the per-graph target energy has ∑_i refs[Z_i]
+        # subtracted before computing the loss, then added back for reporting.
+        element_refs_path = getattr(self.config.dataset, "element_refs_path", None)
+        if element_refs_path:
+            if not os.path.isabs(element_refs_path):
+                element_refs_path = os.path.join(REPO_ROOT, element_refs_path)
+            with open(element_refs_path, "r") as f:
+                refs_data = yaml.safe_load(f)
+            refs = refs_data.get("oc20_elem_refs", refs_data)
+            refs_tensor = torch.tensor(refs, dtype=torch.float64)
+            self.register_buffer("element_refs", refs_tensor)
+        else:
+            self.element_refs = None
 
         # --- Dynamically configure model outputs based on force prediction mode ---
         if self.config.model.predict_forces:
@@ -89,12 +145,20 @@ class OMolModel(pl.LightningModule):
             drop_path_rate=self.config.model.drop_path_rate,
             layer_scale_init_value=self.config.model.layer_scale_init_value,
             attention=self.config.model.attention,
-            ffn_dim_factor=4,
+            ffn_dim_factor=getattr(self.config.model, "ffn_dim_factor", 4),
             rope_sigma=self.config.model.rope_sigma,
             ape_sigma=self.config.model.ape_sigma,
             learned_freqs=self.config.model.learned_freqs,
             freq_init=self.config.model.freq_init,
             use_key=self.config.model.use_key,
+            # OMol25 additions (defaults preserve old behavior):
+            attention_backend=getattr(self.config.model, "attention_backend", "scatter"),
+            qk_norm=bool(getattr(self.config.model, "qk_norm", False)),
+            swiglu=bool(getattr(self.config.model, "swiglu", False)),
+            rope_on_values=bool(getattr(self.config.model, "rope_on_values", False)),
+            activation=getattr(self.config.model, "activation", "gelu"),
+            chgspin_film=chgspin_film,
+            chgspin_embed_dim=chgspin_embed_dim if chgspin_film else None,
         )
 
         # Initialize normalization parameters
@@ -115,6 +179,36 @@ class OMolModel(pl.LightningModule):
         self.test_metrics_force = torchmetrics.MeanAbsoluteError()
         self.test_metrics_energy_per_atom = torchmetrics.MeanAbsoluteError()
 
+    def _chgspin_mixed_per_node(self, graph: Data) -> Union[torch.Tensor, None]:
+        """Build per-node chg/spin conditioning signal.
+
+        Reads per-graph ``graph.charge`` and ``graph.spin`` (floats), passes each
+        through its own RFF embedder, concatenates, mixes through one Linear+SiLU,
+        and broadcasts to per-node via ``graph.batch``. Returns ``None`` if charge
+        and spin embedders are not configured (chgspin_mode='off' and no FiLM).
+        """
+        if self.charge_embedder is None:
+            return None
+        # Per-graph charge/spin (float). Tolerate dataset variants that omit spin.
+        charge = getattr(graph, "charge", None)
+        spin = getattr(graph, "spin", None)
+        if charge is None:
+            num_graphs = int(graph.batch.max().item()) + 1
+            charge = torch.zeros(num_graphs, dtype=torch.float32, device=graph.pos.device)
+        else:
+            charge = charge.view(-1).float()
+        if spin is None:
+            spin = torch.zeros_like(charge)
+        else:
+            spin = spin.view(-1).float()
+        chg_emb = self.charge_embedder(charge)           # (B, embed_dim)
+        spn_emb = self.spin_embedder(spin)               # (B, embed_dim)
+        mixed = torch.nn.functional.silu(
+            self.chgspin_mix(torch.cat([chg_emb, spn_emb], dim=-1))
+        )                                                # (B, embed_dim)
+        # Broadcast per-graph signal to per-node via batch index.
+        return mixed[graph.batch]                        # (N, embed_dim)
+
     def forward(self, graph: Data) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         graph = graph.to(self.device)
         # Prepare input features
@@ -123,11 +217,18 @@ class OMolModel(pl.LightningModule):
             x.append(graph.pos)
         if "charges" in self.config.dataset.scalar_features:
             x.append(graph.charges[:, None])
-        
+
         x = torch.cat(x, dim=-1)
-        
+
+        # Build per-node chg/spin conditioning signal (None if disabled).
+        chgspin_mixed = self._chgspin_mixed_per_node(graph)
+
         # Forward pass
-        pred_scalar, pred_vec = self.net(x, graph.pos, graph.batch, vec=None, avg_num_nodes=self.avg_num_nodes.to(graph.pos.device))
+        pred_scalar, pred_vec = self.net(
+            x, graph.pos, graph.batch, vec=None,
+            avg_num_nodes=self.avg_num_nodes.to(graph.pos.device),
+            chgspin_mixed_per_node=chgspin_mixed,
+        )
         
         pred_energy = pred_scalar.view(-1)
         
@@ -163,6 +264,23 @@ class OMolModel(pl.LightningModule):
 
         return pred_energy, pred_force
 
+    def _per_graph_ref_sum(self, graph: Data) -> torch.Tensor:
+        """Sum of per-element reference energies over the atoms of each graph.
+
+        Returns a tensor of shape (num_graphs,) in the same device as graph.pos.
+        Returns zeros if element_refs is not configured or atomic_numbers is
+        unavailable on the batch.
+        """
+        if self.element_refs is None or not hasattr(graph, "atomic_numbers"):
+            num_graphs = int(graph.batch.max().item()) + 1
+            return torch.zeros(num_graphs, device=graph.pos.device, dtype=torch.float32)
+        z = graph.atomic_numbers.long().clamp_min(0)
+        refs_per_atom = self.element_refs.to(graph.pos.device)[z]
+        num_graphs = int(graph.batch.max().item()) + 1
+        out = torch.zeros(num_graphs, dtype=self.element_refs.dtype, device=graph.pos.device)
+        out.index_add_(0, graph.batch, refs_per_atom)
+        return out.float()
+
     def training_step(self, graph: Data, batch_idx: int) -> torch.Tensor:
         if self.config.training.train_augm:
             batch_size = graph.batch.max().item() + 1
@@ -174,16 +292,23 @@ class OMolModel(pl.LightningModule):
         pred_energy, pred_force = self.pred_energy_and_force(graph)
         
         # Loss calculation
-        energy_loss = torch.mean((pred_energy - ((graph.energy - self.shift) / self.scale))**2)
+        # Element-reference subtraction: when loaded, regress against the
+        # graph energy *with per-element references removed* (a flat, less
+        # extreme target distribution). For metric reporting we add the refs
+        # back so absolute meV values are comparable across runs.
+        ref_sum = self._per_graph_ref_sum(graph)
+        target_energy = graph.energy - ref_sum
+        energy_loss = torch.mean((pred_energy - ((target_energy - self.shift) / self.scale))**2)
         force_loss = torch.mean(torch.sqrt(torch.sum((pred_force - graph.forces / self.scale)**2, -1)))
         loss = energy_loss + self.config.training.lambda_F * force_loss
 
-        # Logging metrics (converted to meV and meV/Å)
-        pred_energy_mev = (pred_energy.detach() * self.scale + self.shift) * 1000
+        # Logging metrics (converted to meV and meV/Å). Add element_refs back
+        # for absolute energy reporting (the regression target had them removed).
+        pred_energy_mev = (pred_energy.detach() * self.scale + self.shift + ref_sum) * 1000
         true_energy_mev = graph.energy * 1000
         pred_force_mev_ang = pred_force.detach() * self.scale * 1000
         true_force_mev_ang = graph.forces * 1000
-        
+
         pred_energy_per_atom_mev = pred_energy_mev / graph.num_atoms
         true_energy_per_atom_mev = true_energy_mev / graph.num_atoms
 
@@ -206,15 +331,16 @@ class OMolModel(pl.LightningModule):
     
     def validation_step(self, graph: Data, batch_idx: int) -> None:
         pred_energy, pred_force = self.pred_energy_and_force(graph)
-        
-        pred_energy_mev = (pred_energy * self.scale + self.shift) * 1000
+
+        ref_sum = self._per_graph_ref_sum(graph)
+        pred_energy_mev = (pred_energy * self.scale + self.shift + ref_sum) * 1000
         true_energy_mev = graph.energy * 1000
         pred_force_mev_ang = pred_force * self.scale * 1000
         true_force_mev_ang = graph.forces * 1000
-        
+
         pred_energy_per_atom_mev = pred_energy_mev / graph.num_atoms
         true_energy_per_atom_mev = true_energy_mev / graph.num_atoms
-        
+
         self.valid_metric(pred_energy_mev, true_energy_mev)
         self.valid_metric_force(pred_force_mev_ang, true_force_mev_ang)
         self.valid_metric_energy_per_atom(pred_energy_per_atom_mev, true_energy_per_atom_mev)
@@ -226,8 +352,9 @@ class OMolModel(pl.LightningModule):
     
     def test_step(self, graph: Data, batch_idx: int) -> None:
         pred_energy, pred_force = self.pred_energy_and_force(graph)
-        
-        pred_energy_mev = (pred_energy * self.scale + self.shift) * 1000
+
+        ref_sum = self._per_graph_ref_sum(graph)
+        pred_energy_mev = (pred_energy * self.scale + self.shift + ref_sum) * 1000
         true_energy_mev = graph.energy * 1000
         pred_force_mev_ang = pred_force * self.scale * 1000
         true_force_mev_ang = graph.forces * 1000
