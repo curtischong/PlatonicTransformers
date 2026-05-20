@@ -66,17 +66,29 @@ run_one "AllScAIP variant (local_global=true, interaction_radius=2.0)" \
     --model.local_global=true \
     --model.interaction_radius=2.0
 
-# 3) eSEN-sm baseline — eSCNMDBackbone + MLP_EFS_Head.
-#    Override direct_forces=true: the yaml default is conservative forces
-#    (forces = -∂E/∂pos via autograd.grad inside the head), which makes
-#    loss.backward() a double-backward and is incompatible with torch.compile
-#    + aot_autograd. With direct_forces=true the head predicts forces
-#    directly (separate output head), no double backward, so the comparison
-#    stays apples-to-apples with the platoformer side (all compiled).
-run_one "eSEN-sm baseline (direct forces)" \
+# 3) eSEN-sm baseline — the paper-recipe variant that's actually used in
+#    production OMol training runs (zaq6tuhv on wandb). Overrides relative
+#    to configs/omol_esen.yaml — which is OUR private eSEN-small variant
+#    (lmax=4 / l=12 / h=32, conservative forces) — bring it back to the
+#    paper recipe:
+#      lmax=2, num_layers=5, sphere_channels=hidden_channels=128
+#      direct_forces=true   (paper uses direct; also required for compile —
+#                            conservative forces use autograd.grad in the
+#                            head, which makes loss.backward() a double
+#                            backward and is incompatible with
+#                            torch.compile + aot_autograd)
+#      compile=true
+#    Keeps activation_checkpointing=true and cutoff=6.0 from the yaml,
+#    matching zaq6tuhv.
+run_one "eSEN-sm baseline (paper recipe, direct forces)" \
     --config configs/omol_esen.yaml \
     --training.compile=true \
-    --model.direct_forces=true
+    --model.direct_forces=true \
+    --model.lmax=2 \
+    --model.mmax=2 \
+    --model.num_layers=5 \
+    --model.sphere_channels=128 \
+    --model.hidden_channels=128
 
 echo
 echo "=== JOB FINISHED ($(date)) ==="
