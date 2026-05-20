@@ -168,9 +168,11 @@ def main():
         )
         single_batch = None
         batches_iter = iter(train_loader)
+        _ma = getattr(config.training, "max_atoms_per_batch", None)
+        _db = getattr(config.training, "dynamic_batching", False)
         batch_label = (f"real OMol25 batches via get_omol_loaders, "
-                       f"max_atoms_per_batch={config.training.max_atoms_per_batch}, "
-                       f"dynamic_batching={config.training.dynamic_batching}")
+                       f"max_atoms_per_batch={_ma}, "
+                       f"dynamic_batching={_db}")
 
     print()
     print("=" * 60)
