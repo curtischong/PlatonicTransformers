@@ -489,35 +489,29 @@ class OMolModel(pl.LightningModule):
             # → cosine decay to 0. `interval=step` updates the LR each
             # optimizer step.
             #
-            # Compute total_steps explicitly: Lightning 2.6's
-            # `trainer.estimated_stepping_batches` can under-count under DDP +
-            # custom batch_sampler + use_distributed_sampler=False (it returned
-            # ~1 epoch's worth of batches on the 4× H100 snellius run
-            # `iftu53zm`, vs ~20 epochs on the 1× H100 run `y0b70zqc` with the
-            # same code). The bug makes the cosine decay finish in 1 epoch on
-            # multi-GPU; LR ≈ 0 from epoch 2 onward and the model undertrains.
-            # Hipster's Lightning 2.5.5 didn't have this regression, which is
-            # why qcczbpfn's 4-GPU schedule was correct. Fall back to
-            # estimated_stepping_batches if the dataloader length isn't
-            # available at configure_optimizers time.
-            try:
-                batches_per_epoch = len(self.trainer.train_dataloader)
-                max_epochs = int(self.trainer.max_epochs or 1)
-                accum = max(1, int(self.trainer.accumulate_grad_batches or 1))
-                total_steps = (batches_per_epoch * max_epochs) // accum
-                print(
-                    f"[OMolModel] cosine schedule total_steps={total_steps} "
-                    f"(batches_per_epoch={batches_per_epoch} × max_epochs={max_epochs} "
-                    f"÷ accum={accum}; estimated_stepping_batches reported "
-                    f"{int(self.trainer.estimated_stepping_batches)})"
-                )
-            except (AttributeError, TypeError, ValueError, NotImplementedError) as exc:
-                total_steps = int(self.trainer.estimated_stepping_batches)
-                print(
-                    f"[OMolModel] cosine schedule total_steps={total_steps} "
-                    f"(falling back to estimated_stepping_batches; could not "
-                    f"derive from dataloader: {exc!r})"
-                )
+            # Compute total_steps explicitly. Lightning 2.6's
+            # `trainer.estimated_stepping_batches` returns
+            # `world_size × global_optimizer_steps` under DDPStrategy (verified
+            # on snellius 4× H100: 1 328 920 returned for a setup where the
+            # global step count is ~332 230 = 16 612 batches/epoch × 20 epochs).
+            # That makes warmup `world_size×` too long on multi-GPU: at step
+            # 8049 of `iftu53zm`, with warmup=0.01×1 328 920=13 289, the LR
+            # was 8049/13289 × peak = 3.03e-4, matching the observed value
+            # exactly. Hipster's Lightning 2.5.5 didn't have this regression.
+            # Divide by world_size to recover the GLOBAL step count expected
+            # by the cosine schedule (scheduler.step() runs per global
+            # optimizer.step()).
+            #
+            # We also tried reading `len(self.trainer.train_dataloader)` first,
+            # but that's None at configure_optimizers time on Lightning 2.6.
+            esb = int(self.trainer.estimated_stepping_batches)
+            world_size = int(getattr(self.trainer, "world_size", 1) or 1)
+            total_steps = esb // world_size if world_size > 1 else esb
+            print(
+                f"[OMolModel] cosine schedule total_steps={total_steps} "
+                f"(estimated_stepping_batches={esb}, world_size={world_size}; "
+                f"divided out the Lightning 2.6 DDP world_size factor)"
+            )
             num_warmup = float(getattr(self.config.scheduler, "num_warmup_steps", 0.01))
             if num_warmup <= 1.0:
                 num_warmup_steps = int(num_warmup * total_steps)
