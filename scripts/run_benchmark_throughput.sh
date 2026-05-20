@@ -88,10 +88,10 @@ run_one "eSEN-sm baseline (paper recipe, direct forces)" \
     --config configs/omol_esen.yaml \
     --training.compile=true \
     --training.dynamic_batching=true \
-    --training.max_atoms_per_batch=20000 \
-    --training.max_atoms_per_batch_val=20000 \
-    --training.max_edges_per_batch=4000000 \
-    --training.max_edges_per_batch_val=4000000 \
+    --training.max_atoms_per_batch=12000 \
+    --training.max_atoms_per_batch_val=12000 \
+    --training.max_edges_per_batch=2400000 \
+    --training.max_edges_per_batch_val=2400000 \
     --model.direct_forces=true \
     --model.lmax=2 \
     --model.mmax=2 \
