@@ -37,10 +37,16 @@ from platonic_transformers.utils.config_loader import (
 )
 from platonic_transformers.datasets.omol import Batch
 
-# Same precision + cudnn knobs as the training entrypoint.
+# Same precision + cudnn + dynamo knobs as the training entrypoint
+# (mains/main_omol.py module-level). Needed for torch.compile to behave on
+# dynamic shapes without dropping to eager mode.
 torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
+import torch._dynamo as _dynamo  # noqa: E402
+_dynamo.config.cache_size_limit = 256
+_dynamo.config.force_parameter_static_shapes = False
+_dynamo.config.capture_scalar_outputs = True
 
 
 def _make_synthetic_batch(n_atoms: int, device, dtype=torch.float32,
@@ -109,6 +115,23 @@ def main():
         model = OMolModel(config).to(device)
     model.train()  # train mode → autograd graph built (needed for eSEN forces)
 
+    # Compile self.net the same way OMolModel.setup() does on stage="fit".
+    # We bypass Lightning here, so we have to run this step manually; without
+    # it the benchmark times eager-mode forwards, which under-reports throughput
+    # on the same recipe that qcczbpfn runs with `compile=true`. Honors yaml's
+    # `training.compile` flag and CLI overrides.
+    if bool(getattr(config.training, "compile", False)):
+        cmode = str(getattr(config.training, "compile_mode", "default"))
+        cdyn = getattr(config.training, "compile_dynamic", None)
+        try:
+            model.net = torch.compile(model.net, mode=cmode, dynamic=cdyn)
+            compiled = True
+        except Exception as exc:
+            print(f"[benchmark] torch.compile failed ({exc!r}); running eager.")
+            compiled = False
+    else:
+        compiled = False
+
     n_params = sum(p.numel() for p in model.parameters())
 
     batch = _make_synthetic_batch(n_atoms, device=device)
@@ -130,6 +153,7 @@ def main():
     print(f"  device:        {device}  "
           f"({torch.cuda.get_device_name(0) if device.type == 'cuda' else 'cpu'})")
     print(f"  n_atoms:       {n_atoms}")
+    print(f"  compile:       {compiled}  (yaml training.compile)")
     print(f"  warmup steps:  {n_warmup}")
     print(f"  timed steps:   {n_timed}")
     print("=" * 60)
