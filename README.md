@@ -1,3 +1,20 @@
+> ## Quick start on Snellius (OMol25 force-field run)
+>
+> ```bash
+> git clone -b production git@github.com:ebekkers/platonic-omol.git
+> cd platonic-omol
+> source /scratch-shared/ebekkers/scaling-laws-venv-v2/bin/activate
+> ./scripts/run_omol_snellius.sh 4     # 4× H100 (qcczbpfn-equivalent: 3000 atoms/rank × 4 = 12k effective)
+> ./scripts/run_omol_snellius.sh 1     # 1× H100 (12000 atoms/step, same effective batch)
+> ```
+>
+> - **Data**: `/scratch-shared/ebekkers/omol25/open_mol/{train_4M,val}/` already exists. The `metadata.npz` next to each shard is the natoms-cache for dynamic batching — auto-detected. Only run `scripts/build_omol_natoms_cache.py <dir>` if you point at a different data dir.
+> - **Venv**: `/scratch-shared/ebekkers/scaling-laws-venv-v2` is pre-built (torch 2.8 / cu128, flash-attn 2 + 3, fairchem, lightning, ml-collections, mendeleev — all the deps `qcczbpfn` used). For a fresh env elsewhere, `./setup.sh` builds one from `requirements.txt`; the snellius venv is older than that recipe but verified working against this code.
+> - **Recipe**: `configs/omol.yaml` is the canonical `qcczbpfn` recipe. See `HANDOVER.md` for the audit trail and the current PR-vs-qcczbpfn gap.
+> - **Override**: both launchers honor `DATA_PATH=...` and `VENV_PATH=...` env vars; edit `scripts/run_omol_platonic_snellius_{1,4}gpu.sh` for partition/wallclock tweaks.
+>
+> ---
+
 # Platonic Transformers: A Solid Choice For Equivariance
 
 <p align="left">
