@@ -488,7 +488,36 @@ class OMolModel(pl.LightningModule):
             # `num_warmup_steps` (fraction of total steps if <1, else integer)
             # → cosine decay to 0. `interval=step` updates the LR each
             # optimizer step.
-            total_steps = self.trainer.estimated_stepping_batches
+            #
+            # Compute total_steps explicitly: Lightning 2.6's
+            # `trainer.estimated_stepping_batches` can under-count under DDP +
+            # custom batch_sampler + use_distributed_sampler=False (it returned
+            # ~1 epoch's worth of batches on the 4× H100 snellius run
+            # `iftu53zm`, vs ~20 epochs on the 1× H100 run `y0b70zqc` with the
+            # same code). The bug makes the cosine decay finish in 1 epoch on
+            # multi-GPU; LR ≈ 0 from epoch 2 onward and the model undertrains.
+            # Hipster's Lightning 2.5.5 didn't have this regression, which is
+            # why qcczbpfn's 4-GPU schedule was correct. Fall back to
+            # estimated_stepping_batches if the dataloader length isn't
+            # available at configure_optimizers time.
+            try:
+                batches_per_epoch = len(self.trainer.train_dataloader)
+                max_epochs = int(self.trainer.max_epochs or 1)
+                accum = max(1, int(self.trainer.accumulate_grad_batches or 1))
+                total_steps = (batches_per_epoch * max_epochs) // accum
+                print(
+                    f"[OMolModel] cosine schedule total_steps={total_steps} "
+                    f"(batches_per_epoch={batches_per_epoch} × max_epochs={max_epochs} "
+                    f"÷ accum={accum}; estimated_stepping_batches reported "
+                    f"{int(self.trainer.estimated_stepping_batches)})"
+                )
+            except (AttributeError, TypeError, ValueError, NotImplementedError) as exc:
+                total_steps = int(self.trainer.estimated_stepping_batches)
+                print(
+                    f"[OMolModel] cosine schedule total_steps={total_steps} "
+                    f"(falling back to estimated_stepping_batches; could not "
+                    f"derive from dataloader: {exc!r})"
+                )
             num_warmup = float(getattr(self.config.scheduler, "num_warmup_steps", 0.01))
             if num_warmup <= 1.0:
                 num_warmup_steps = int(num_warmup * total_steps)
