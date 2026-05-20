@@ -388,6 +388,25 @@ class OMolModel(pl.LightningModule):
     def on_train_epoch_end(self) -> None:
         pass
 
+    def on_validation_epoch_end(self) -> None:
+        # Re-log the scaling-laws counters at val time so wandb has a value
+        # for `token_processed` / `total_flops_used` / `train_seconds` at the
+        # same `_step` as `e_mae/val` etc. Without this, val curves grey out
+        # when those axes are selected (val rows have no token_processed
+        # value, so wandb can't pair them). Mirrors hipster's
+        # `GraphModel.on_validation_epoch_end`.
+        import time
+        train_seconds = (
+            float(time.perf_counter() - self._fit_start_time)
+            if self._fit_start_time is not None else 0.0
+        )
+        self.log("token_processed", self.token_processed_buf,
+                 sync_dist=True, reduce_fx="sum")
+        self.log("total_flops_used", self.total_flops_used_buf,
+                 sync_dist=True, reduce_fx="sum")
+        self.log("train_seconds", train_seconds,
+                 sync_dist=True, reduce_fx="mean")
+
     def validation_step(self, graph: Data, batch_idx: int) -> None:
         pred_energy, pred_force = self.pred_energy_and_force(graph)
         loss, e_loss, f_loss, e_mae_mev, f_mae_mev, e_mae_per_atom_mev, total = \
