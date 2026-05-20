@@ -7,3 +7,7 @@ checkpoints/
 *.ckpt
 slurm-*.out
 .env
+
+# Local baseline-reference dump from hipster (wandb run dir + metadata.npz)
+# — too large to commit; reference material only.
+public-pr-prep/baseline-reference/

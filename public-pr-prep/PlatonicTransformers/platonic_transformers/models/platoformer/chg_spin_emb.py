@@ -1,14 +1,7 @@
-"""Charge/Spin embeddings for OMol25 force-field training.
-
-Adopted from
-https://github.com/facebookresearch/fairchem/blob/main/src/fairchem/core/models/uma/escn_md_block.py
-under the FAIR-Chemistry license. We use the ``pos_emb`` variant (random Fourier
-features) in the OMol25 training recipe — see ``mains/main_omol.py`` for usage.
-"""
 import torch
 import torch.nn as nn
 
-
+# Adopted from https://github.com/facebookresearch/fairchem/blob/main/src/fairchem/core/models/uma/escn_md_block.py
 class ChgSpinEmbedding(nn.Module):
     def __init__(
         self,
@@ -81,3 +74,4 @@ class ChgSpinEmbedding(nn.Module):
                 )
             )
         raise ValueError(f"embedding type {self.embedding_type} not implemented")
+

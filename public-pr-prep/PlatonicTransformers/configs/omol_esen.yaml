@@ -24,7 +24,7 @@ dataset:
   scalar_features: []
   vector_features: []
   debug_subset: null
-  referencing: true
+  referencing: false
   include_hof: false
   scale_shift: false
   recalculate_stats: false
@@ -60,6 +60,7 @@ training:
                                             # atom-based packing for fairness.
   gradient_clip_val: 1.0
   train_augm: true
+  lambda_E: 10.0
   lambda_F: 20.0
 
 optimizer:
@@ -76,14 +77,14 @@ scheduler:
 
 logging:
   enabled: true
-  project_name: "Platonic-OMol-eSEN"
+  project_name: "scaling-laws-symmetry"
   wandb_run_name: null
-  wandb_identity: null
+  wandb_identity: "omol-leaderboard"
   log_every_n_steps: 50
 
 system:
   gpus: 1
-  num_workers: 0
+  num_workers: 4
   enable_progress_bar: true
   accumulate_grad_batches: 1
   strategy: "auto"

@@ -1,15 +1,16 @@
+import math
 import os
+import pickle
+import threading
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+import torch.distributed as dist
+from torch.utils.data import Dataset, DataLoader, Sampler, Subset
 from fairchem.core.datasets import AseDBDataset
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 from ase.neighborlist import neighbor_list
 from mendeleev import element
-from platonic_transformers.datasets.k_hot_encoding import KHOT_EMBEDDINGS  # This was from fairchem repo.    
-import pickle
-import threading
+from platonic_transformers.datasets.k_hot_encoding import KHOT_EMBEDDINGS  # This was from fairchem repo.
 
 # a simple length cache for database
 LENGTH_CACHE = {}
@@ -35,7 +36,21 @@ class Batch:
         if key in self._metadata:
             return self._metadata[key]
         return getattr(self, key)
-    
+
+    def __contains__(self, key):
+        """Support `key in batch` (dict-style). Without this, Python falls
+        back to int-indexed iteration through __getitem__, which raises
+        TypeError because getattr() requires string keys. fairchem's
+        eSCNMDBackbone does `"pbc" in data_dict`, so this is required for
+        the eSEN baseline."""
+        return key in self._metadata or hasattr(self, key)
+
+    def get(self, key, default=None):
+        """Dict-style .get() — fairchem's escn_md.py calls data_dict.get(...)."""
+        if key in self._metadata:
+            return self._metadata[key]
+        return getattr(self, key, default)
+
     def __setitem__(self, key, value):
         """Allow dictionary-style assignment."""
         setattr(self, key, value)
@@ -72,16 +87,19 @@ class Batch:
             self._metadata.clear()
 
 class OMolDataset(Dataset):
-    def __init__(self, root='./data/omol', 
-                 split=None, 
-                 use_charges=False, 
-                 debug_subset=None, 
-                 seed=42, 
-                 energy_referencing=True, 
+    def __init__(self, root='./data/omol',
+                 split=None,
+                 use_charges=False,
+                 debug_subset=None,
+                 seed=42,
+                 energy_referencing=True,
                  edges=False,
                  edge_attr=False,
                  force_distance_method=True,
-                 use_k_hot=False):
+                 use_k_hot=False,
+                 require_natoms_cache=False,
+                 train_subdir='train_4M',
+                 val_subdir='val'):
         
         # [Keep all the existing initialization code until dataset_path is set]
         
@@ -116,10 +134,15 @@ class OMolDataset(Dataset):
             'atom_decoder': element_symbols
         }
         
-        if split == 'test':
-            self.dataset_path = os.path.join(self.root, 'neutral_val')
+        # qcczbpfn-style data split: dedicated train_4M dir for training, and a
+        # SEPARATE held-out val dir for validation (no internal 80/20 split).
+        # Subdir names default to `train_4M` and `val` (matching the OMol25
+        # release layout that qcczbpfn used), but can be overridden via the
+        # constructor args (or yaml: `dataset.train_subdir`/`dataset.val_subdir`).
+        if split == 'test' or split == 'val':
+            self.dataset_path = os.path.join(self.root, val_subdir)
         else:
-            self.dataset_path = os.path.join(self.root, 'neutral_train')
+            self.dataset_path = os.path.join(self.root, train_subdir)
 
         if not os.path.exists(self.dataset_path):
             raise FileNotFoundError(f"OMol dataset not found at {self.dataset_path}")
@@ -144,20 +167,86 @@ class OMolDataset(Dataset):
         # Set indices based on length
         self.indices = list(range(dataset_length))
 
+        # Load pre-computed per-sample atom counts from metadata.npz if present.
+        # OMol25 ships a `metadata.npz` next to the .aselmdb shards with a
+        # `natoms` array indexed the same as the dataset. Using this cache
+        # turns `get_num_atoms(idx)` into an O(1) numpy lookup — required by
+        # the DynamicAtomBatchSampler, which otherwise does one full LMDB
+        # read per sample (drastically slow on a cold dataset over shared
+        # GPFS — kills throughput entirely).
+        #
+        # Mirrors `AseDBDatasetWithChargeSpin._natoms_cache` in the private.
+        # When `require_natoms_cache=True` (set by `get_omol_loaders` whenever
+        # `dynamic_batching=True`) the cache MUST be present — we raise rather
+        # than silently fall back to the slow path, because there's no
+        # plausible reason to enable dynamic batching without the cache.
+        self._natoms_cache = None
+        metadata_path = os.path.join(self.dataset_path, "metadata.npz")
+        cache_load_error = None
+        if os.path.exists(metadata_path):
+            try:
+                with np.load(metadata_path, allow_pickle=False) as m:
+                    if "natoms" in m.files:
+                        natoms = np.asarray(m["natoms"], dtype=np.int64)
+                        if len(natoms) == dataset_length:
+                            self._natoms_cache = natoms
+                            print(f"natoms cache loaded from {metadata_path} ({len(natoms)} samples)")
+                        else:
+                            cache_load_error = (
+                                f"metadata.npz natoms length {len(natoms)} != dataset "
+                                f"len {dataset_length} at {metadata_path}")
+                    else:
+                        cache_load_error = f"metadata.npz at {metadata_path} has no 'natoms' key"
+            except Exception as exc:
+                cache_load_error = f"failed to load metadata.npz at {metadata_path}: {exc}"
+        else:
+            cache_load_error = f"metadata.npz not found at {metadata_path}"
+
+        if require_natoms_cache and self._natoms_cache is None:
+            raise FileNotFoundError(
+                f"natoms cache is required for dynamic batching but is unavailable: "
+                f"{cache_load_error}.\n"
+                f"OMol25 ships a `metadata.npz` next to the .aselmdb shards. If your "
+                f"data came from the standard fairchem distribution it should already "
+                f"be there. For custom shards or symlinked directories, run:\n"
+                f"    python scripts/build_omol_natoms_cache.py {self.dataset_path}\n"
+                f"to generate it (one-time, ~minutes). Or set "
+                f"`training.dynamic_batching=false` in the yaml."
+            )
+
         if debug_subset is not None:
             debug_subset = int(debug_subset)
             self.indices = self.indices[:debug_subset]
 
         self.split = split
-        if split and split != 'test':
-            # original splitting logic (unchanged)
-            self.apply_split()
+        # No internal 80/20 split — train uses ALL of neutral_train (the full
+        # 4M subset on Snellius) and val uses ALL of neutral_val. Matches the
+        # qcczbpfn data wiring exactly.
 
     def _init_ase_dataset(self):
         """Safely initialize dataset in the worker process when needed"""
         if self._thread_local_dataset is None:
             self._thread_local_dataset = AseDBDataset({"src": self.dataset_path})
         return self._thread_local_dataset
+
+    def get_num_atoms(self, idx):
+        """Atom count for the molecule at index ``idx`` (consulted by the
+        DynamicAtomBatchSampler to pack batches by atom budget). O(1) via the
+        precomputed natoms cache when ``metadata.npz`` is present."""
+        if self._natoms_cache is not None:
+            return int(self._natoms_cache[int(idx)])
+        ds = self._init_ase_dataset()
+        if hasattr(ds, "get_num_atoms"):
+            return int(ds.get_num_atoms(idx))
+        if hasattr(ds, "get_atoms"):
+            return int(len(ds.get_atoms(idx)))
+        # Fallback: pull the row and count atomic_numbers.
+        item = ds[idx]
+        if hasattr(item, "atomic_numbers"):
+            return int(len(item.atomic_numbers))
+        if hasattr(item, "pos"):
+            return int(len(item.pos))
+        raise RuntimeError(f"Cannot determine num_atoms for idx={idx}")
 
     def set_scale_shift(self, scale=1.0, shift=0.0):
         """Set scale and shift for energy normalization."""
@@ -356,6 +445,12 @@ class OMolDataset(Dataset):
         # Get additional properties
         name = atoms.info.get('name', f'mol_{actual_idx}') if hasattr(atoms, 'info') else f'mol_{actual_idx}'
         smiles = atoms.info.get('smiles', '') if hasattr(atoms, 'info') else ''
+
+        # Per-molecule charge/spin conditioning (qcczbpfn recipe). Stored under
+        # atoms.info by the OMol25 distribution. Distinct from per-atom partial
+        # charges in `atoms.get_initial_charges()` (which we also read above).
+        charge = int(atoms.info.get('charge', 0)) if hasattr(atoms, 'info') else 0
+        spin = int(atoms.info.get('spin', 0)) if hasattr(atoms, 'info') else 0
         
         # Convert to tensors
         x = torch.from_numpy(x)
@@ -384,11 +479,13 @@ class OMolDataset(Dataset):
             'edge_attr': edge_attr,
             'name': name,
             'smiles': smiles,
-            'composition': composition, 
+            'composition': composition,
             'idx': actual_idx,
             'num_atoms': num_atoms,
             'charges': torch.from_numpy(charges),
-            'atomic_numbers': torch.from_numpy(atomic_numbers)
+            'atomic_numbers': torch.from_numpy(atomic_numbers),
+            'charge': torch.tensor([charge], dtype=torch.long),
+            'spin': torch.tensor([spin], dtype=torch.long),
         }
         
         return item
@@ -403,6 +500,7 @@ def collate_fn(batch):
     """Collate function for batching OMol data."""
     pos, x, energy, forces, batch_idx = [], [], [], [], []
     names, smiles_list, compositions, indices, num_atoms_list, charges_batch, atomic_numbers_batch = [], [], [], [], [], [], []
+    charge_batch, spin_batch = [], []
     cum_nodes = 0
     
     # Check if edges are being used at all
@@ -432,7 +530,9 @@ def collate_fn(batch):
         num_atoms_list.append(item['num_atoms'])
         charges_batch.append(item['charges'])
         atomic_numbers_batch.append(item['atomic_numbers'])
-        
+        charge_batch.append(item['charge'])
+        spin_batch.append(item['spin'])
+
         cum_nodes += num_nodes
     
     # Combine tensors
@@ -456,12 +556,15 @@ def collate_fn(batch):
     charges = torch.cat(charges_batch, dim=0)
     atomic_numbers = torch.cat(atomic_numbers_batch, dim=0)
     num_of_atoms = torch.tensor(num_atoms_list, dtype=torch.long)
-    
+    charge = torch.cat(charge_batch, dim=0)
+    spin = torch.cat(spin_batch, dim=0)
+
     batch_dict = {
         'pos': pos, 'x': x, 'energy': energy, 'forces': forces, 'batch': batch_idx,
         'edge_index': edge_index, 'edge_attr': edge_attr, 'name': names, 'smiles': smiles_list,
         'composition': compositions, 'idx': indices, 'num_atoms': num_of_atoms,
-        'charges': charges, 'atomic_numbers': atomic_numbers, 'cum_nodes': torch.tensor(cum_nodes)
+        'charges': charges, 'atomic_numbers': atomic_numbers, 'cum_nodes': torch.tensor(cum_nodes),
+        'charge': charge, 'spin': spin,
     }
     
     # Clean up to prevent memory leaks
@@ -766,10 +869,167 @@ def compute_stats(dataset, save_path=None, use_rmsd=True):
     
     return None, dataset_stats
 
-def get_omol_loaders(root='/ssdstore/omol/', batch_size=32, num_workers=4, 
-                     use_charges=False, seed=42, debug_subset=None, include_hof=False, 
-                     referencing=True, scale_shift=False, recalculate=False, use_k_hot=False, 
-                     edge=False, edge_attr=False, force_distance_method=True):
+
+class DynamicAtomBatchSamplerForAseDB(Sampler):
+    """Batch sampler that caps graph count, total atoms, and (optionally) total
+    within-graph edges per batch.
+
+    Verbatim port of ``DynamicAtomBatchSamplerForAseDB`` from the private
+    ``src/data/omol_4m_module.py`` — same algorithm qcczbpfn used to pack
+    batches up to ``max_atoms_per_batch=3000`` / ``max_edges_per_batch=600000``.
+
+    The PlatoFormer ``graph_scattered_attention`` path materialises a tensor of
+    shape ``[E, G*H, D_h]`` where ``E = sum_over_graphs(n_atoms_i^2)``. ``E``
+    therefore grows *quadratically* in per-graph atom count, so a batch that
+    fits the ``max_atoms`` budget can still OOM if it happens to be composed
+    of a few large molecules. ``max_edges`` caps this quadratic term directly.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        max_batch_size,
+        max_atoms=None,
+        max_edges=None,
+        shuffle=True,
+        drop_last=False,
+        seed=0,
+        num_replicas=None,
+        rank=None,
+    ):
+        if max_batch_size <= 0:
+            raise ValueError("max_batch_size must be positive")
+
+        self.dataset = dataset
+        self.max_batch_size = max_batch_size
+        self.max_atoms = max_atoms
+        self.max_edges = max_edges
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+        self.epoch = 0
+        self._atom_count_cache = {}
+
+        if num_replicas is None:
+            if dist.is_available() and dist.is_initialized():
+                num_replicas = dist.get_world_size()
+            else:
+                num_replicas = 1
+
+        if rank is None:
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+            else:
+                rank = 0
+
+        if rank < 0 or rank >= num_replicas:
+            raise ValueError(f"Invalid rank {rank}, expected in [0, {num_replicas - 1}]")
+
+        self.num_replicas = num_replicas
+        self.rank = rank
+
+        dataset_length = len(self.dataset)
+        if self.drop_last:
+            self.num_samples = math.floor(dataset_length / self.num_replicas)
+        else:
+            self.num_samples = math.ceil(dataset_length / self.num_replicas)
+        self.total_size = self.num_samples * self.num_replicas
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def _resolve_underlying_dataset_and_index(self, local_idx):
+        dataset = self.dataset
+        actual_idx = local_idx
+        while isinstance(dataset, Subset):
+            actual_idx = dataset.indices[actual_idx]
+            dataset = dataset.dataset
+        return dataset, int(actual_idx)
+
+    def _get_num_atoms(self, local_idx):
+        if local_idx in self._atom_count_cache:
+            return self._atom_count_cache[local_idx]
+        dataset, actual_idx = self._resolve_underlying_dataset_and_index(local_idx)
+        if hasattr(dataset, "get_num_atoms"):
+            num_atoms = int(dataset.get_num_atoms(actual_idx))
+        elif hasattr(dataset, "get_atoms"):
+            num_atoms = len(dataset.get_atoms(actual_idx))
+        else:
+            raise TypeError("Dataset must provide get_num_atoms(idx) or get_atoms(idx)")
+        self._atom_count_cache[local_idx] = num_atoms
+        return num_atoms
+
+    def __len__(self):
+        if self.max_atoms is None:
+            return max(1, math.ceil(self.num_samples / self.max_batch_size))
+        avg_atoms_per_graph = 50
+        avg_graphs_per_batch = max(1, int(self.max_atoms / avg_atoms_per_graph))
+        return max(1, math.ceil(self.num_samples / avg_graphs_per_batch))
+
+    def _generate_indices(self):
+        size = len(self.dataset)
+        if self.shuffle:
+            generator = torch.Generator()
+            generator.manual_seed(self.seed + self.epoch)
+            indices = torch.randperm(size, generator=generator).tolist()
+        else:
+            indices = list(range(size))
+        if not self.drop_last:
+            padding_size = self.total_size - len(indices)
+            if padding_size > 0:
+                full_repeats = (padding_size + len(indices) - 1) // len(indices)
+                indices += (indices * full_repeats)[:padding_size]
+        else:
+            indices = indices[: self.total_size]
+        if len(indices) < self.total_size:
+            raise RuntimeError("Insufficient indices to cover replicas")
+        indices = indices[self.rank : self.total_size : self.num_replicas]
+        return indices[: self.num_samples]
+
+    def __iter__(self):
+        indices = self._generate_indices()
+        batch = []
+        atom_total = 0
+        edge_total = 0  # sum of n_atoms^2 across graphs in the batch
+        for local_idx in indices:
+            num_atoms = self._get_num_atoms(local_idx)
+            num_edges = num_atoms * num_atoms
+            if batch and (
+                len(batch) >= self.max_batch_size
+                or (self.max_atoms is not None and atom_total + num_atoms > self.max_atoms)
+                or (self.max_edges is not None and edge_total + num_edges > self.max_edges)
+            ):
+                yield batch
+                batch = []
+                atom_total = 0
+                edge_total = 0
+            exceeds_atoms = self.max_atoms is not None and num_atoms > self.max_atoms
+            exceeds_edges = self.max_edges is not None and num_edges > self.max_edges
+            if exceeds_atoms or exceeds_edges:
+                if batch:
+                    yield batch
+                    batch = []
+                    atom_total = 0
+                    edge_total = 0
+                if exceeds_edges:
+                    continue
+                yield [local_idx]
+                continue
+            batch.append(local_idx)
+            atom_total += num_atoms
+            edge_total += num_edges
+        if batch and (not self.drop_last or len(batch) == self.max_batch_size):
+            yield batch
+
+
+def get_omol_loaders(root='/ssdstore/omol/', batch_size=32, num_workers=4,
+                     use_charges=False, seed=42, debug_subset=None, include_hof=False,
+                     referencing=True, scale_shift=False, recalculate=False, use_k_hot=False,
+                     edge=False, edge_attr=False, force_distance_method=True,
+                     dynamic_batching=False, max_atoms_per_batch=None,
+                     max_atoms_per_batch_val=None, max_edges_per_batch=None,
+                     max_edges_per_batch_val=None,
+                     train_subdir='train_4M', val_subdir='val'):
     """
     Create DataLoaders for train, validation, and test splits of OMol dataset.
     
@@ -789,36 +1049,21 @@ def get_omol_loaders(root='/ssdstore/omol/', batch_size=32, num_workers=4,
         tuple: (train_loader, val_loader, test_loader, energy_coefficients, dataset_stats)
     """
  
-    # Create datasets for each split
-    train_dataset = OMolDataset(root=root, split='train', 
-                                use_charges=use_charges, 
-                                debug_subset=debug_subset, 
-                                seed=seed, 
-                                energy_referencing=referencing,
-                                use_k_hot=use_k_hot,
-                                edges=edge,
-                                edge_attr=edge_attr,
-                                force_distance_method=force_distance_method)
-
-    val_dataset  = OMolDataset(root=root, split='val', 
-                              use_charges=use_charges, 
-                              debug_subset=debug_subset, 
-                              seed=seed, 
-                              energy_referencing=referencing,
-                              use_k_hot=use_k_hot,
-                              edges=edge,
-                              edge_attr=edge_attr,
-                              force_distance_method=force_distance_method)
-
-    test_dataset = OMolDataset(root=root, split='test', 
-                                  use_charges=use_charges, 
-                                  debug_subset=debug_subset, 
-                                  seed=seed, 
-                                  energy_referencing=referencing,
-                                  use_k_hot=use_k_hot,
-                                  edges=edge,
-                                  edge_attr=edge_attr,
-                                  force_distance_method=force_distance_method)
+    # Create datasets for each split. When dynamic_batching is enabled the
+    # DynamicAtomBatchSampler needs O(1) atom-count lookups via metadata.npz
+    # — pass `require_natoms_cache=True` so OMolDataset raises a clear error
+    # instead of silently falling back to slow per-sample LMDB reads.
+    _common = dict(
+        use_charges=use_charges, debug_subset=debug_subset, seed=seed,
+        energy_referencing=referencing, use_k_hot=use_k_hot,
+        edges=edge, edge_attr=edge_attr,
+        force_distance_method=force_distance_method,
+        require_natoms_cache=bool(dynamic_batching),
+        train_subdir=train_subdir, val_subdir=val_subdir,
+    )
+    train_dataset = OMolDataset(root=root, split='train', **_common)
+    val_dataset = OMolDataset(root=root, split='val', **_common)
+    test_dataset = OMolDataset(root=root, split='test', **_common)
 
     energy_coefficients = None
     dataset_stats = None
@@ -874,38 +1119,52 @@ def get_omol_loaders(root='/ssdstore/omol/', batch_size=32, num_workers=4,
         dataset.set_scale_shift(scale=dataset_stats['scale'], shift=dataset_stats['shift'])
   
 
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
+    # When dynamic_batching=True we replace the fixed-size batching with the
+    # private's DynamicAtomBatchSamplerForAseDB, packing each batch up to a
+    # ``max_atoms_per_batch`` (and optionally ``max_edges_per_batch``) budget
+    # rather than a fixed graph count. ``batch_size`` then becomes the cap on
+    # graphs per batch (qcczbpfn used 16 for train, 16 for val).
+    common = dict(
         collate_fn=collate_fn,
         num_workers=num_workers,
         persistent_workers=True if num_workers > 0 else False,
         pin_memory=True,
-        multiprocessing_context='spawn' # Use spawn to avoid CUDA/fork issues
+        multiprocessing_context='spawn',
+        prefetch_factor=4 if num_workers > 0 else None,  # qcczbpfn parity
     )
-    
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        collate_fn=collate_fn,
-        num_workers=num_workers,
-        persistent_workers=True if num_workers > 0 else False,
-        pin_memory=True,
-        multiprocessing_context='spawn' # Use spawn to avoid CUDA/fork issues
-    )
-    
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        collate_fn=collate_fn,
-        num_workers=num_workers,
-        persistent_workers=True if num_workers > 0 else False,
-        pin_memory=True,
-        multiprocessing_context='spawn' # Use spawn to avoid CUDA/fork issues
-    )
+    if dynamic_batching:
+        # qcczbpfn parity: with dynamic batching on, the per-batch graph cap is
+        # effectively disabled — batches are bounded only by max_atoms /
+        # max_edges. Hipster's `_create_dataloader` passes max_batch_size=999999
+        # in this branch; the `batch_size` yaml field is for the static-batching
+        # fallback only. Passing batch_size as the graph cap here would
+        # underfill batches whenever mean(atoms/molecule) × batch_size <
+        # max_atoms_per_batch (the case for OMol25-4M: 55 × 64 = 3520 ≪ 12000).
+        _GRAPH_CAP = 999999
+        train_sampler = DynamicAtomBatchSamplerForAseDB(
+            train_dataset, max_batch_size=_GRAPH_CAP,
+            max_atoms=max_atoms_per_batch, max_edges=max_edges_per_batch,
+            shuffle=True, drop_last=False, seed=seed,
+        )
+        val_sampler = DynamicAtomBatchSamplerForAseDB(
+            val_dataset, max_batch_size=_GRAPH_CAP,
+            max_atoms=max_atoms_per_batch_val or max_atoms_per_batch,
+            max_edges=max_edges_per_batch_val or max_edges_per_batch,
+            shuffle=False, drop_last=False, seed=seed,
+        )
+        test_sampler = DynamicAtomBatchSamplerForAseDB(
+            test_dataset, max_batch_size=_GRAPH_CAP,
+            max_atoms=max_atoms_per_batch_val or max_atoms_per_batch,
+            max_edges=max_edges_per_batch_val or max_edges_per_batch,
+            shuffle=False, drop_last=False, seed=seed,
+        )
+        train_loader = DataLoader(train_dataset, batch_sampler=train_sampler, **common)
+        val_loader = DataLoader(val_dataset, batch_sampler=val_sampler, **common)
+        test_loader = DataLoader(test_dataset, batch_sampler=test_sampler, **common)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, **common)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, **common)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, **common)
     
     if debug_subset is not None:
         print(f"Debug mode: Using subset of {debug_subset} samples")

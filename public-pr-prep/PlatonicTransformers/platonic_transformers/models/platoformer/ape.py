@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from platonic_transformers.models.platoformer.groups import PLATONIC_GROUPS
+from .groups import PLATONIC_GROUPS
 
 
 class APE(nn.Module):
@@ -159,17 +159,25 @@ class PlatonicAPE(nn.Module):
         # group_elements shape: (g, d, d) | freqs shape: (d, f_g)
         # -> freqs_rotated shape: (g, d, f_g)
         # where g=num_G, d=spatial_dims, f_g=num_frequencies_g
-        freqs_rotated = torch.einsum('gij, jf -> gif', self.group_elements, self.freqs)
+        # Compute angles in fp64 (precision experiment): with random Gaussian
+        # frequencies and Å-scale positions, |angles| reaches tens of radians,
+        # where even fp32 trig accumulates per-layer × per-atom rounding error.
+        # pos and freqs are tiny so fp64 cost is negligible.
+        out_dtype = pos.dtype
+        with torch.amp.autocast(device_type=pos.device.type, enabled=False):
+            freqs_rotated = torch.einsum(
+                'gij, jf -> gif', self.group_elements.double(), self.freqs.double()
+            )
 
-        # 2. --- Project positions onto all sets of rotated frequencies ---
-        # This computes the dot product for each of the G frequency sets.
-        # pos shape: (...d) | freqs_rotated shape: (g, d, f_g)
-        # -> angles shape: (...g, f_g)
-        angles = torch.einsum('...d, gdf -> ...gf', pos, freqs_rotated)
+            # 2. --- Project positions onto all sets of rotated frequencies ---
+            # This computes the dot product for each of the G frequency sets.
+            # pos shape: (...d) | freqs_rotated shape: (g, d, f_g)
+            # -> angles shape: (...g, f_g)
+            angles = torch.einsum('...d, gdf -> ...gf', pos.double(), freqs_rotated)
 
-        # 3. --- Compute sinusoidal features for each group element ---
-        cos_angles = torch.cos(angles)
-        sin_angles = torch.sin(angles)
+            # 3. --- Compute sinusoidal features for each group element ---
+            cos_angles = torch.cos(angles).to(out_dtype)
+            sin_angles = torch.sin(angles).to(out_dtype)
 
         # Concatenate sin and cos features for each group element's embedding
         # embedding_grouped shape: (...g, 2*f_g) which is (..., num_G, embed_dim_g)

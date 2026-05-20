@@ -4,7 +4,7 @@ import math
 from torch import Tensor
 
 # This assumes the PLATONIC_GROUPS dictionary from the previous problem is available.
-from platonic_transformers.models.platoformer.groups import PLATONIC_GROUPS
+from .groups import PLATONIC_GROUPS
 
 
 class PlatonicRoPE(nn.Module):
@@ -104,13 +104,20 @@ class PlatonicRoPE(nn.Module):
         if G != self.num_G or H != self.num_heads or D_h != self.head_dim:
             raise ValueError(f"Input shape {x.shape} does not match expected shape (..., {self.num_G}, {self.num_heads}, {self.head_dim}).")
 
-        # 2. --- Compute Rotated frequencies ---
-        freqs_rotated = torch.einsum('gde, hfe -> ghfd', self.group_elements, self.freqs)
-
-        # Compute rotation angles for each rotated position and each base head.
-        angles = torch.einsum('...d, ghfd -> ...ghf', pos, freqs_rotated)
-        cos_angles = torch.cos(angles)
-        sin_angles = torch.sin(angles)
+        # 2. --- Compute Rotated frequencies and trig in fp64 (precision experiment) ---
+        # Under bf16-mixed autocast, einsum + sin/cos run in bf16; in fp32 they run in
+        # fp32. With rope_sigma=4 and Å-scale positions, |angles| reaches 20-60 rad,
+        # where even fp32 spacing (~7e-6 at θ=60) propagates non-trivial trig error
+        # per layer × per atom × 12 layers. Promote angle compute to fp64 — pos and
+        # freqs are tiny so the fp64 cost is negligible. cos/sin downcast back to
+        # the input dtype before applying the rotation.
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
+            freqs_rotated = torch.einsum(
+                'gde, hfe -> ghfd', self.group_elements.double(), self.freqs.double()
+            )
+            angles = torch.einsum('...d, ghfd -> ...ghf', pos.double(), freqs_rotated)
+            cos_angles = torch.cos(angles).to(x.dtype)
+            sin_angles = torch.sin(angles).to(x.dtype)
         if inverse:
             sin_angles = -sin_angles
 

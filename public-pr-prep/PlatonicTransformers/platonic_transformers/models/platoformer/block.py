@@ -4,9 +4,9 @@ from torch import Tensor
 from typing import Optional, Callable
 import torch.nn.functional as F
 
-from platonic_transformers.models.platoformer.conv import PlatonicConv
-from platonic_transformers.models.platoformer.linear import PlatonicLinear
-from platonic_transformers.models.platoformer.groups import PLATONIC_GROUPS
+from .conv import PlatonicConv
+from .linear import PlatonicLinear
+from .groups import PLATONIC_GROUPS
 
 # Use apex FusedLayerNorm when available (fused CUDA kernel, ~2x faster)
 try:
@@ -31,8 +31,10 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: Tensor) -> Tensor:
-        if _quack_rmsnorm is not None and x.is_cuda:
-            return _quack_rmsnorm(x, self.weight, eps=self.eps)
+        # Precision experiment: bypass quack RMSNorm and always run the explicit
+        # fp32-internal path. Quack's internal precision under fp32 inputs has not
+        # been audited; the explicit fallback is provably fp32 for the variance
+        # reduction. (No-op for the wd-sweep recipe, which uses LayerNorm.)
         input_dtype = x.dtype
         x = x.to(torch.float32)
         variance = x.pow(2).mean(-1, keepdim=True)
@@ -125,6 +127,9 @@ class PlatonicBlock(nn.Module):
         attention_backend: str = "scatter",
         qk_norm: bool = False,
         swiglu: bool = False,
+        qk_dim_factor: int = 1,
+        v_dim_factor: int = 1,
+        rope_v_independent: bool = False,
     ) -> None:
         super().__init__()
         self.swiglu = swiglu
@@ -161,6 +166,9 @@ class PlatonicBlock(nn.Module):
             rope_on_values=rope_on_values,
             attention_backend=attention_backend,
             qk_norm=qk_norm,
+            qk_dim_factor=qk_dim_factor,
+            v_dim_factor=v_dim_factor,
+            rope_v_independent=rope_v_independent,
         )
 
         # Equivariant Feed-Forward Network. When swiglu=True, replace the
@@ -204,7 +212,9 @@ class PlatonicBlock(nn.Module):
         pos: Tensor,
         batch: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
-        avg_num_nodes = 1.0
+        avg_num_nodes = 1.0,
+        edge_index: Optional[Tensor] = None,
+        edge_window: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Args:
@@ -212,12 +222,15 @@ class PlatonicBlock(nn.Module):
             pos (Tensor): Position tensor of shape [..., D_spatial].
             batch (Optional[Tensor]): For graph mode. Batch index for each element.
             mask (Optional[Tensor]): For dense mode. Boolean mask.
+            edge_index (Optional[Tensor]): Precomputed radius-graph edge index [2, E]
+                (reused across all layers; computed once by the transformer).
+            edge_window (Optional[Tensor]): Per-edge polynomial cutoff weight [E].
         Returns:
             Tensor: Output feature tensor of the same shape [..., G*C].
         """
         # Interaction Block (pre-normalization is always used)
         normed_x = self._normalize(x, self.norm1)
-        interaction_out = self._interaction_block(normed_x, pos, batch, mask, avg_num_nodes)
+        interaction_out = self._interaction_block(normed_x, pos, batch, mask, avg_num_nodes, edge_index, edge_window)
         if self.gamma_1 is not None:
             interaction_out = self._apply_layer_scale(interaction_out, self.gamma_1)
         x = x + self.drop_path1(interaction_out)
@@ -249,10 +262,16 @@ class PlatonicBlock(nn.Module):
         return normed_reshaped.view(*leading_dims, -1)
 
     def _interaction_block(
-        self, x: Tensor, pos: Tensor, batch: Optional[Tensor], mask: Optional[Tensor], avg_num_nodes = 1.0
+        self, x: Tensor, pos: Tensor, batch: Optional[Tensor], mask: Optional[Tensor],
+        avg_num_nodes = 1.0,
+        edge_index: Optional[Tensor] = None,
+        edge_window: Optional[Tensor] = None,
     ) -> Tensor:
         """Wrapper for the PlatonicConv layer."""
-        interaction_output = self.interaction(x, pos, batch=batch, mask=mask, avg_num_nodes=avg_num_nodes)
+        interaction_output = self.interaction(
+            x, pos, batch=batch, mask=mask, avg_num_nodes=avg_num_nodes,
+            edge_index=edge_index, edge_window=edge_window,
+        )
         return self.dropout1(interaction_output)
 
     def _ff_block(self, x: Tensor) -> Tensor:
