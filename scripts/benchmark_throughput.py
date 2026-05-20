@@ -199,7 +199,22 @@ def main():
                         (_step_fwd, "forward only (MD-inference cost)")]:
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats()
-        total, _ = _time(step_fn, lbl)
+        try:
+            total, _ = _time(step_fn, lbl)
+        except RuntimeError as exc:
+            # eSEN's conservative forces use autograd.grad inside the head;
+            # `loss.backward()` on the result is a double-backward that
+            # torch.compile+aot_autograd does NOT support. Catch and skip the
+            # offending mode so the other one (and the next model) still runs.
+            msg = str(exc)
+            print()
+            print(f"--- {lbl} ---")
+            print(f"  SKIPPED: {type(exc).__name__}: {msg.splitlines()[-1] if msg else ''}")
+            if "double backward" in msg:
+                print(f"  (this is the known torch.compile + autograd.grad-inside-forward")
+                print(f"   incompatibility; rerun this mode with --training.compile=false)")
+            results.append((lbl, None, None, None, None, None, None))
+            continue
         peak = (torch.cuda.max_memory_allocated() / 1024**3
                 if device.type == "cuda" else 0.0)
         ms_per_step = (total / n_timed) * 1000.0
@@ -210,6 +225,8 @@ def main():
                         atoms_per_sec, ns_per_day_at_1fs, peak))
 
     for lbl, total, ms, sps, aps, nspd, peak in results:
+        if total is None:
+            continue
         print()
         print(f"--- {lbl} ---")
         print(f"  total wall:    {total:.3f} s")
