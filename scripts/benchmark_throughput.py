@@ -134,47 +134,67 @@ def main():
     print(f"  timed steps:   {n_timed}")
     print("=" * 60)
 
-    def _step():
+    def _step_fwd_bwd():
         e, f = model.pred_energy_and_force(batch)
         # Cheap pseudo-loss; we only care about touching the gradient path.
         loss = e.sum() + f.pow(2).sum()
         loss.backward()
         model.zero_grad(set_to_none=True)
 
-    # Warmup (includes torch.compile pass, dynamo recompiles, kernel autotune).
-    for _ in range(n_warmup):
-        _step()
-    if device.type == "cuda":
-        torch.cuda.synchronize()
+    def _step_fwd():
+        # Forward only (MD-inference convention from the AllScAIP paper).
+        # `enable_grad` is required for eSEN: its conservative forces are
+        # computed via autograd.grad inside the MLP_EFS_Head, so the grad
+        # tape must be live even when we never call .backward(). For direct-
+        # force models (Platonic / AllScAIP variant) it's harmless.
+        with torch.enable_grad():
+            e, f = model.pred_energy_and_force(batch)
+        # Drop autograd refs so activations from this step are freed before
+        # the next forward (otherwise eSEN's grad-graph piles up).
+        del e, f
 
-    # Timed.
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(n_timed):
-        _step()
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    t1 = time.perf_counter()
+    def _time(step_fn, label):
+        # Warmup (compile + dynamo recompiles + kernel autotune).
+        for _ in range(n_warmup):
+            step_fn()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        # Timed.
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(n_timed):
+            step_fn()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        return t1 - t0, label
 
-    total = t1 - t0
-    ms_per_step = (total / n_timed) * 1000.0
-    steps_per_sec = n_timed / total
-    atoms_per_sec = n_atoms * steps_per_sec
-    # 1 fs MD timestep convention (matches AllScAIP paper for inference;
-    # this script is fwd+bwd so ns/day here = "training-steps as fake-MD steps").
-    ns_per_day_at_1fs = 1e-6 * steps_per_sec * 86400.0
+    results = []
+    for step_fn, lbl in [(_step_fwd_bwd, "forward + backward (training cost)"),
+                        (_step_fwd, "forward only (MD-inference cost)")]:
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+        total, _ = _time(step_fn, lbl)
+        peak = (torch.cuda.max_memory_allocated() / 1024**3
+                if device.type == "cuda" else 0.0)
+        ms_per_step = (total / n_timed) * 1000.0
+        steps_per_sec = n_timed / total
+        atoms_per_sec = n_atoms * steps_per_sec
+        ns_per_day_at_1fs = 1e-6 * steps_per_sec * 86400.0
+        results.append((lbl, total, ms_per_step, steps_per_sec,
+                        atoms_per_sec, ns_per_day_at_1fs, peak))
 
-    print()
-    print("--- throughput (forward + backward) ---")
-    print(f"  total wall:    {total:.3f} s")
-    print(f"  ms/step:       {ms_per_step:.2f}")
-    print(f"  steps/sec:     {steps_per_sec:.2f}")
-    print(f"  atoms/sec:     {atoms_per_sec:,.0f}")
-    print(f"  ns/day @1fs:   {ns_per_day_at_1fs:.3f}  (fwd+bwd, not pure inference)")
-    if device.type == "cuda":
-        peak = torch.cuda.max_memory_allocated() / 1024**3
-        print(f"  peak VRAM:     {peak:.2f} GiB")
+    for lbl, total, ms, sps, aps, nspd, peak in results:
+        print()
+        print(f"--- {lbl} ---")
+        print(f"  total wall:    {total:.3f} s")
+        print(f"  ms/step:       {ms:.2f}")
+        print(f"  steps/sec:     {sps:.2f}")
+        print(f"  atoms/sec:     {aps:,.0f}")
+        print(f"  ns/day @1fs:   {nspd:.3f}")
+        if device.type == "cuda":
+            print(f"  peak VRAM:     {peak:.2f} GiB")
     print()
 
 
