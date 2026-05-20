@@ -50,7 +50,7 @@ model:
   atom_embed: "learned"                     # nn.Embedding(max_Z, embed_dim) — qcczbpfn
   max_num_elements: 100
   embed_init_std: null                      # null → 1/sqrt(embed_dim)
-  avg_num_nodes: 26.5                       # average atoms/molecule on OMol25-4M
+  avg_num_nodes: 54.9                       # average atoms on OMol25-4m, use 26.5 for Neutral set.
 
   # Attention
   attention: true
