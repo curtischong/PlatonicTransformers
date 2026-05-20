@@ -66,16 +66,17 @@ run_one "AllScAIP variant (local_global=true, interaction_radius=2.0)" \
     --model.local_global=true \
     --model.interaction_radius=2.0
 
-# 3) eSEN-sm baseline — eSCNMDBackbone + MLP_EFS_Head, conservative forces
-#    (autograd.grad). Much smaller per-step compute but autograd-forces are
-#    more expensive than direct forces. omol_esen.yaml doesn't set
-#    training.compile, so override here so the comparison stays apples-to-
-#    apples with the platoformer side (both compiled). If compile fails on
-#    eSCNMDBackbone, the bench script falls back to eager and prints
-#    "compile: False" — we'll see it in the header.
-run_one "eSEN-sm baseline" \
+# 3) eSEN-sm baseline — eSCNMDBackbone + MLP_EFS_Head.
+#    Override direct_forces=true: the yaml default is conservative forces
+#    (forces = -∂E/∂pos via autograd.grad inside the head), which makes
+#    loss.backward() a double-backward and is incompatible with torch.compile
+#    + aot_autograd. With direct_forces=true the head predicts forces
+#    directly (separate output head), no double backward, so the comparison
+#    stays apples-to-apples with the platoformer side (all compiled).
+run_one "eSEN-sm baseline (direct forces)" \
     --config configs/omol_esen.yaml \
-    --training.compile=true
+    --training.compile=true \
+    --model.direct_forces=true
 
 echo
 echo "=== JOB FINISHED ($(date)) ==="
