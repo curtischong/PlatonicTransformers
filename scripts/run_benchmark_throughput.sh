@@ -21,9 +21,11 @@ set -e
 mkdir -p logs
 
 VENV_PATH="${VENV_PATH:-/scratch-shared/ebekkers/scaling-laws-venv-v2}"
-N_ATOMS="${N_ATOMS:-1000}"
-N_WARMUP="${N_WARMUP:-10}"
-N_TIMED="${N_TIMED:-50}"
+DATA_PATH="${DATA_PATH:-/scratch-shared/ebekkers/omol25/open_mol}"
+DATA_SOURCE="${DATA_SOURCE:-real}"      # 'real' (production batches) or 'synthetic' (one fixed-N molecule)
+N_ATOMS="${N_ATOMS:-1000}"               # only used when DATA_SOURCE=synthetic
+N_WARMUP="${N_WARMUP:-5}"                # fewer batches needed for real-data mode
+N_TIMED="${N_TIMED:-20}"
 
 source "${VENV_PATH}/bin/activate"
 module load 2024 2>/dev/null || true
@@ -46,9 +48,11 @@ run_one () {
     echo "###  ${label}"
     echo "##############################################################"
     python scripts/benchmark_throughput.py \
+        --bench.data_source="${DATA_SOURCE}" \
         --bench.n_atoms="${N_ATOMS}" \
         --bench.n_warmup="${N_WARMUP}" \
         --bench.n_timed="${N_TIMED}" \
+        --dataset.data_dir="${DATA_PATH}" \
         "$@"
 }
 

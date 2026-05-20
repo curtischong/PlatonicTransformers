@@ -102,6 +102,9 @@ def main():
     n_warmup = int(getattr(bench, "n_warmup", 10)) if bench else 10
     n_timed = int(getattr(bench, "n_timed", 50)) if bench else 50
     n_atoms = int(getattr(bench, "n_atoms", 1000)) if bench else 1000
+    data_source = str(getattr(bench, "data_source", "real")).lower() if bench else "real"
+    if data_source not in ("synthetic", "real"):
+        raise ValueError(f"--bench.data_source must be 'synthetic' or 'real', got {data_source!r}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -134,7 +137,40 @@ def main():
 
     n_params = sum(p.numel() for p in model.parameters())
 
-    batch = _make_synthetic_batch(n_atoms, device=device)
+    # Batch source.
+    if data_source == "synthetic":
+        single_batch = _make_synthetic_batch(n_atoms, device=device)
+        batches_iter = None
+        batch_label = f"synthetic, N={n_atoms} atoms in a 30 Å box (CHNO)"
+    else:
+        from platonic_transformers.datasets.omol import get_omol_loaders
+        # Same dataloader settings as production training. dynamic_batching
+        # honors training.max_atoms_per_batch from the chosen yaml.
+        train_loader, _, _, _, _ = get_omol_loaders(
+            root=config.dataset.data_dir,
+            batch_size=config.training.batch_size,
+            num_workers=int(getattr(config.system, "num_workers", 8)),
+            use_charges=False,
+            seed=config.seed,
+            debug_subset=config.dataset.debug_subset,
+            referencing=config.dataset.referencing,
+            include_hof=config.dataset.include_hof,
+            scale_shift=config.dataset.scale_shift,
+            recalculate=config.dataset.recalculate_stats,
+            use_k_hot=config.dataset.use_khot_encoding,
+            dynamic_batching=bool(getattr(config.training, "dynamic_batching", False)),
+            max_atoms_per_batch=getattr(config.training, "max_atoms_per_batch", None),
+            max_atoms_per_batch_val=getattr(config.training, "max_atoms_per_batch_val", None),
+            max_edges_per_batch=getattr(config.training, "max_edges_per_batch", None),
+            max_edges_per_batch_val=getattr(config.training, "max_edges_per_batch_val", None),
+            train_subdir=str(getattr(config.dataset, "train_subdir", "train_4M")),
+            val_subdir=str(getattr(config.dataset, "val_subdir", "val")),
+        )
+        single_batch = None
+        batches_iter = iter(train_loader)
+        batch_label = (f"real OMol25 batches via get_omol_loaders, "
+                       f"max_atoms_per_batch={config.training.max_atoms_per_batch}, "
+                       f"dynamic_batching={config.training.dynamic_batching}")
 
     print()
     print("=" * 60)
@@ -152,47 +188,68 @@ def main():
     print(f"  params:        {n_params:,}")
     print(f"  device:        {device}  "
           f"({torch.cuda.get_device_name(0) if device.type == 'cuda' else 'cpu'})")
-    print(f"  n_atoms:       {n_atoms}")
+    print(f"  data source:   {batch_label}")
     print(f"  compile:       {compiled}  (yaml training.compile)")
     print(f"  warmup steps:  {n_warmup}")
     print(f"  timed steps:   {n_timed}")
     print("=" * 60)
 
-    def _step_fwd_bwd():
-        e, f = model.pred_energy_and_force(batch)
-        # Cheap pseudo-loss; we only care about touching the gradient path.
+    def _step_fwd_bwd(b):
+        e, f = model.pred_energy_and_force(b)
         loss = e.sum() + f.pow(2).sum()
         loss.backward()
         model.zero_grad(set_to_none=True)
 
-    def _step_fwd():
+    def _step_fwd(b):
         # Forward only (MD-inference convention from the AllScAIP paper).
-        # `enable_grad` is required for eSEN: its conservative forces are
+        # `enable_grad` required for eSEN: its conservative forces are
         # computed via autograd.grad inside the MLP_EFS_Head, so the grad
         # tape must be live even when we never call .backward(). For direct-
         # force models (Platonic / AllScAIP variant) it's harmless.
         with torch.enable_grad():
-            e, f = model.pred_energy_and_force(batch)
+            e, f = model.pred_energy_and_force(b)
         # Drop autograd refs so activations from this step are freed before
         # the next forward (otherwise eSEN's grad-graph piles up).
         del e, f
 
+    def _atoms_in(b) -> int:
+        # Works for both Batch and fairchem AtomicData: pos has one row per atom.
+        return int(b.pos.shape[0])
+
     def _time(step_fn, label):
-        # Warmup (compile + dynamo recompiles + kernel autotune).
+        """Warmup then time. Returns (total_wall_seconds, atoms_processed)."""
+        if data_source == "synthetic":
+            # Same batch reused for warmup + timed — most reps go in compile/
+            # autotune the first time, steady-state by step ~5.
+            for _ in range(n_warmup):
+                step_fn(single_batch)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(n_timed):
+                step_fn(single_batch)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            return time.perf_counter() - t0, n_timed * _atoms_in(single_batch)
+
+        # data_source == "real"
+        # Warmup. Each batch from the dataloader has a different shape, so
+        # compile may recompile a few times before stabilising.
         for _ in range(n_warmup):
-            step_fn()
+            b = next(batches_iter).to(device)
+            step_fn(b)
         if device.type == "cuda":
             torch.cuda.synchronize()
         # Timed.
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+        atoms_seen = 0
         t0 = time.perf_counter()
         for _ in range(n_timed):
-            step_fn()
+            b = next(batches_iter).to(device)
+            step_fn(b)
+            atoms_seen += _atoms_in(b)
         if device.type == "cuda":
             torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        return t1 - t0, label
+        return time.perf_counter() - t0, atoms_seen
 
     results = []
     for step_fn, lbl in [(_step_fwd_bwd, "forward + backward (training cost)"),
@@ -200,7 +257,7 @@ def main():
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats()
         try:
-            total, _ = _time(step_fn, lbl)
+            total, atoms = _time(step_fn, lbl)
         except RuntimeError as exc:
             # eSEN's conservative forces use autograd.grad inside the head;
             # `loss.backward()` on the result is a double-backward that
@@ -213,29 +270,40 @@ def main():
             if "double backward" in msg:
                 print(f"  (this is the known torch.compile + autograd.grad-inside-forward")
                 print(f"   incompatibility; rerun this mode with --training.compile=false)")
-            results.append((lbl, None, None, None, None, None, None))
+            results.append({"lbl": lbl, "skipped": True})
             continue
         peak = (torch.cuda.max_memory_allocated() / 1024**3
                 if device.type == "cuda" else 0.0)
         ms_per_step = (total / n_timed) * 1000.0
         steps_per_sec = n_timed / total
-        atoms_per_sec = n_atoms * steps_per_sec
+        atoms_per_sec = atoms / total
+        avg_atoms_per_step = atoms / n_timed
+        # ns/day at 1 fs MD timestep — meaningful when the batch is one
+        # fixed-N system (synthetic), ambiguous when batches vary (real).
         ns_per_day_at_1fs = 1e-6 * steps_per_sec * 86400.0
-        results.append((lbl, total, ms_per_step, steps_per_sec,
-                        atoms_per_sec, ns_per_day_at_1fs, peak))
+        results.append({
+            "lbl": lbl, "skipped": False,
+            "total": total, "ms_per_step": ms_per_step,
+            "steps_per_sec": steps_per_sec, "atoms_per_sec": atoms_per_sec,
+            "avg_atoms": avg_atoms_per_step,
+            "ns_per_day": ns_per_day_at_1fs, "peak": peak,
+        })
 
-    for lbl, total, ms, sps, aps, nspd, peak in results:
-        if total is None:
-            continue
+    for r in results:
         print()
-        print(f"--- {lbl} ---")
-        print(f"  total wall:    {total:.3f} s")
-        print(f"  ms/step:       {ms:.2f}")
-        print(f"  steps/sec:     {sps:.2f}")
-        print(f"  atoms/sec:     {aps:,.0f}")
-        print(f"  ns/day @1fs:   {nspd:.3f}")
+        print(f"--- {r['lbl']} ---")
+        if r.get("skipped"):
+            continue
+        print(f"  total wall:    {r['total']:.3f} s")
+        print(f"  ms/step:       {r['ms_per_step']:.2f}")
+        print(f"  steps/sec:     {r['steps_per_sec']:.2f}")
+        print(f"  avg atoms/step:{r['avg_atoms']:,.0f}")
+        print(f"  atoms/sec:     {r['atoms_per_sec']:,.0f}")
+        if data_source == "synthetic":
+            print(f"  ns/day @1fs:   {r['ns_per_day']:.3f}  "
+                  f"(fixed-N synthetic; meaningful for MD inference)")
         if device.type == "cuda":
-            print(f"  peak VRAM:     {peak:.2f} GiB")
+            print(f"  peak VRAM:     {r['peak']:.2f} GiB")
     print()
 
 
