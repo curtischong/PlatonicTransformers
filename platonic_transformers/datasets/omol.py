@@ -1161,6 +1161,16 @@ def get_omol_loaders(root='/ssdstore/omol/', batch_size=32, num_workers=4,
         train_loader = DataLoader(train_dataset, batch_sampler=train_sampler, **common)
         val_loader = DataLoader(val_dataset, batch_sampler=val_sampler, **common)
         test_loader = DataLoader(test_dataset, batch_sampler=test_sampler, **common)
+        # Attach `set_epoch` to the loader itself so Lightning calls our custom
+        # batch_sampler's set_epoch between epochs (Lightning only looks for
+        # set_epoch on `loader.sampler` or on the loader directly; with
+        # `batch_sampler=` and use_distributed_sampler=False the sampler.set_epoch
+        # is otherwise never called → same shuffle every epoch, defeating
+        # shuffling on DDP and 1-GPU alike). Mirrors hipster's
+        # `_create_dataloader` in omol_4m_module.py.
+        train_loader.set_epoch = train_sampler.set_epoch
+        val_loader.set_epoch = val_sampler.set_epoch
+        test_loader.set_epoch = test_sampler.set_epoch
     else:
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, **common)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, **common)

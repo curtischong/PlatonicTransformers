@@ -49,6 +49,30 @@ def _cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
+def _ddp_global_mean(local_loss_tensor: torch.Tensor) -> torch.Tensor:
+    """Mean reduction across DDP ranks, weighted by the global element count.
+
+    Returns ``local_sum * world_size / global_num_elements`` so that after
+    Lightning's per-step gradient averaging (1/world_size) the effective
+    gradient is the true global mean over all elements across ranks. This is
+    the same trick fairchem's ``DDPLoss(reduction='mean')`` uses, which
+    qcczbpfn / hipster relied on; without it, ``.mean()`` on each rank gives a
+    mean-of-rank-means and biases atoms in smaller-rank batches up when batch
+    sizes vary (dynamic batching). Outside DDP, falls back to ``torch.mean``.
+    """
+    import torch.distributed as dist
+    if not (dist.is_available() and dist.is_initialized()):
+        return local_loss_tensor.mean()
+    local_sum = local_loss_tensor.sum()
+    local_n = torch.tensor(
+        local_loss_tensor.numel(), dtype=local_sum.dtype, device=local_sum.device,
+    )
+    global_n = local_n.clone()
+    dist.all_reduce(global_n, op=dist.ReduceOp.SUM)
+    world_size = dist.get_world_size()
+    return local_sum * world_size / global_n
+
+
 # Performance optimizations — exact qcczbpfn settings (see baseline-reference/
 # wandb/files/config.yaml).
 torch.set_float32_matmul_precision('high')   # qcczbpfn `matmul_precision: high`
@@ -247,10 +271,21 @@ class OMolModel(pl.LightningModule):
         e_target_norm = target_energy / self.scale                # normalized
         f_target_norm = graph.forces / self.scale                 # normalized
 
-        # per-atom MAE on energy (both pred and target divided by natoms)
-        e_loss = ((pred_energy / natoms) - (e_target_norm / natoms)).abs().mean()
-        # L2-norm MAE on forces
-        f_loss = torch.linalg.vector_norm(pred_force - f_target_norm, ord=2, dim=-1).mean()
+        # per-element loss tensors, before reduction
+        e_per_graph = ((pred_energy / natoms) - (e_target_norm / natoms)).abs()      # (B,)
+        f_per_atom = torch.linalg.vector_norm(pred_force - f_target_norm, ord=2, dim=-1)  # (N,)
+
+        # Global-mean reduction across DDP ranks. Matches fairchem's
+        # `DDPLoss(reduction='mean')` (used by hipster's `_compute_loss`): scale
+        # local sum by `world_size / global_num_samples`, so after Lightning's
+        # 1/world_size gradient averaging the effective gradient is the true
+        # global mean over ALL elements (not the mean-of-rank-means). With
+        # dynamic batching, per-rank element counts vary by a few percent, so
+        # mean-of-means biases atoms in smaller-rank batches up; this matters
+        # noticeably on 4× H100 (r8zhh5m0 was 45% worse than qcczbpfn at step
+        # 4999 vs the 1-GPU run's 4% gap — the difference is this reduction).
+        e_loss = _ddp_global_mean(e_per_graph)
+        f_loss = _ddp_global_mean(f_per_atom)
 
         e_weight = float(getattr(self.config.training, "lambda_E", 10.0))
         f_weight = float(getattr(self.config.training, "lambda_F", 20.0))
