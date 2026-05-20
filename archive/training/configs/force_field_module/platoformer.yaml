@@ -23,6 +23,19 @@ net:
   attention_backend: scatter   # "scatter" (default) or "flash" (requires flash-attn)
   qk_norm: false   # RMSNorm on Q and K (head_dim) before RoPE — LLaMA-3 style
   swiglu: false    # Gated FFN: silu(W_gate(x)) * W_up(x) → linear2 (LLaMA style)
+  # Asymmetric Q/K vs V head_dim. qk_dim_factor=N expands Q and K projections to
+  # N × the normal head_dim, while V stays at head_dim. More RoPE frequencies
+  # per head without reducing nhead. Currently only supported with
+  # attention_backend='flash' (V padded to QK width for the kernel, then truncated).
+  qk_dim_factor: 1
+  # V head_dim factor (V projection + output projection). Must be <= qk_dim_factor.
+  # vdf=1 with qkdf>1 → V padded to QK width for flash-attn (output truncated).
+  # vdf=qkdf → full expansion of attention sub-block (no padding waste).
+  v_dim_factor: 1
+  # When true, V's RoPE uses its own independent learnable frequency bank even
+  # when head_dim_v == head_dim_qk. Doubles the spatial-direction coverage of
+  # attention at near-zero parameter cost (just extra freq vectors).
+  rope_v_independent: false
   use_key: false   # When false (and RoPE on), k=1 (constant) and RoPE provides the only relative-key signal
   norm_type: layernorm   # "layernorm" (default, uses apex FusedLayerNorm if available) or "rmsnorm"
   # Charge/Spin: eSEN recipe — pos_emb x2 + Linear+SiLU mix, injected at input only.

@@ -127,6 +127,9 @@ class PlatonicBlock(nn.Module):
         attention_backend: str = "scatter",
         qk_norm: bool = False,
         swiglu: bool = False,
+        qk_dim_factor: int = 1,
+        v_dim_factor: int = 1,
+        rope_v_independent: bool = False,
     ) -> None:
         super().__init__()
         self.swiglu = swiglu
@@ -163,6 +166,9 @@ class PlatonicBlock(nn.Module):
             rope_on_values=rope_on_values,
             attention_backend=attention_backend,
             qk_norm=qk_norm,
+            qk_dim_factor=qk_dim_factor,
+            v_dim_factor=v_dim_factor,
+            rope_v_independent=rope_v_independent,
         )
 
         # Equivariant Feed-Forward Network. When swiglu=True, replace the

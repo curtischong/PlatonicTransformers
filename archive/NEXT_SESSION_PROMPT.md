@@ -1,97 +1,91 @@
-# Opening prompt for next session — Platonic OMol25 leaderboard
+# Opening prompt for next session — Platonic OMol25 (IVI flash-attn runs)
 
 Copy-paste this to start a fresh session:
 
 ---
 
-You are helping with the **Platonic OMol25 leaderboard** project.
+You are helping with the **Platonic OMol25 leaderboard** project, this session focused on **getting useful runs going on IVI now that flash-attn is finally built** for the IVI GPUs (RTX 8000 / RTX A6000, sm_75/sm_86/sm_89). The Snellius runs from the previous session are running unattended on 24h walltimes — only check them if I ask.
 
-**Important:** If you are working from a Nomi workspace, the project repo is nested at `platonic-omol/platonic-omol/`. All paths below are relative to the inner repo root.
+**Important:** If working from the Nomi workspace, the project repo is nested at `workspaces/platonic-omol/platonic-omol/`. All paths below are relative to the inner repo root.
 
-**Scope:** Search for the best PlatoFormer baseline + fair comparison against the new eSEN baseline. Snellius H100 is the primary cluster. Do NOT touch the platonic-scaling-laws repo / GCP v9 sweep — separate workspace.
+## Read first
 
-**Read first (in order):**
-1. `../README.md` (the workspace README) — top section "2026-05-11" covers what was added and the throughput numbers.
-2. `PROGRESS.md` — historical context.
-3. `README.md` (inner repo) — project overview.
+1. `../README.md` — workspace README, top section "2026-05-16" has the current state.
+2. `MEMORY` entries: `reference_snellius.md`, `feedback_commit_workspace_readmes.md`, `project_scaling_laws_symmetry.md`.
+3. This file.
 
-## Handover summary (2026-05-11, end of day)
+## Where things stand (2026-05-16, end of previous session)
 
-### Branch
-`precision-experiments-2026-05-08` (name predates the new work — kept for continuity; rename only if it becomes confusing). Last commit `05ecd31` "esen: fairchem eSCN-MD wrapper + ns/day throughput benchmark".
+### IVI: flash-attn finally builds for sm_86/89
 
-### Currently in flight on Snellius (check first via `ssh snellius 'squeue -u ebekkers'`)
+After two failed attempts (wrong archs; MAX_JOBS=2 too slow), `scripts/install_flash_attn_ivi_v2.sh` patches `setup.py` to add sm_86 and sm_89 `cuda_archs()` branches alongside sm_80, then builds with MAX_JOBS=8 on a 12h walltime allocation. Build 168484 completed in 4h32m. `flash_attn 2.7.4.post1` is now installed in `/home/ebekker/platonic-omol/venv/` and imports cleanly.
 
-| Job | W&B run | What | Wall in |
-|---|---|---|---|
-| `22616965` | (wd-sweep group) | PT rs=4.0 + EMA=0.99, 20ep | started 2026-05-10 |
-| `22620086` | (wd-sweep group) | PT rs=1.0 + EMA=0.99, 20ep | started 2026-05-10 |
-| `22628257` | (wd-sweep group) | **PT rs=2.0 + EMA=0.99, 80ep** | started 2026-05-11 ~09:00 UTC |
-| `22630480` | `7ppvskcg` esen-baseline-20ep | **eSEN-small 20ep** | started 2026-05-11 ~07:45 UTC |
+This is a meaningful unlock: every prior IVI run used the scatter backend (2–2.5× slower than flash at matched precision on hipster's Ada GPUs, per the 2026-05-08 hipster benchmarks).
 
-All four are 1×H100. **eSEN at 5-day cap will get ~14 epochs of 20** (≈7.4 day projected; partition limit 5d). 80-epoch PT projected ~4 days, fits the cap with ~24h slack.
+### IVI repo state
 
-W&B project: `omol-leaderboard/scaling-laws-symmetry`. The PT recipe being searched: h1920, l=8, ffn_dim_factor=2, sin/sin activations, layer_scale=1e-4, rope_on_values=true, chgspin_mode=add, fp32 baseline. The "winning small recipe so far" is `77j0ulg4` (rs=2.0 + EMA=0.99 + 20ep) — that's what the 80-epoch run is extending.
+- `ssh ivi_cluster` lands as user `ebekker` at `~/`. Repo at `/home/ebekker/platonic-omol/`, branch `main`, HEAD `9f14fd4` ("pure-PyTorch radius_graph fallback…"). **This is behind laptop main (`80f26e5`).** First step on IVI is `git pull` — laptop has 3 new commits (qk_norm/swiglu, use_key, norm_type plumbing) that are not yet on IVI but matter only if you want to run the qknorm variants there.
+- Modified-uncommitted on IVI: `scripts/install_flash_attn_ivi.sh` (older version of the install script). Safe to leave — `_v2.sh` is the one that worked.
+- Venv: `/home/ebekker/platonic-omol/venv/` (Python 3.12). Activate via `source /home/ebekker/platonic-omol/venv/bin/activate`.
 
-### What was built on 2026-05-11
+### Pre-existing IVI launchers (in `scripts/`)
 
-1. **eSEN baseline trainable in our pipeline.** New wrapper `training/nets/uma/model.py` (`EquivariantNet`) around fairchem's `eSCNMDBackbone` + `MLP_EFS_Head` with `direct_forces=False` so forces are conservative (autograd from energy — the "smooth-energy" recipe that distinguishes eSEN from UMA-direct). Config `training/configs/force_field_module/esen.yaml` (3.4M params: sphere=hidden=32, lmax=4, mmax=2, 12 layers, activation_checkpointing=true). Launch `scripts/run_esen_small_20ep_fp32.sh`. Mandatory: `trainer.inference_mode=false` for autograd-grad val.
+- `run_pt2_upstream_long_sig4_dyn_ivi.sh` — older, scatter backend
+- `run_pt2_upstream_long_sig4_ema_dyn_ivi.sh` — older + EMA
+- `run_pt2_upstream_long_sig4_wd_bs_ivi.sh` — older wd/bs sweep
+- `run_pt2_ivi_geodude_lsablation.sh` — recent ls=null ablation set, scatter
+- `smoke_ivi.sh`, `smoke_ivi_all6000.sh`, `smoke_ivi_radius_lg.sh` — short smoke tests
 
-2. **ns/day inference benchmark** matching AllScAIP (Qu et al. 2026, arXiv:2603.06567) Table 2 protocol. `training/benchmark_ns_per_day.py` + `scripts/run_benchmark_ns_per_day.sh`. `MODE=single` constructs one fairchem `AtomicData` system of N atoms (random C/H/N/O, uniform in 30Å box) → paper protocol. `MODE=batched` uses one real dynamic-batched mini-batch. Both single-GPU, fp32, forward only, dt=1 fs.
+None of these currently set `ATTENTION_BACKEND=flash`. **There is no "production" flash-enabled IVI launcher yet** — this is the first concrete task.
 
-### Headline result (single H100, N=1000 atoms, single-system mode, fp32 forward)
+### Pending / waiting items
 
-| Model | Params | ms/step | **ns/day** | atom-ns/day |
-|---|---|---|---|---|
-| PT (`77j0ulg4` recipe) | 18.2M | 24.7 | **3.49** | 3.5e3 |
-| eSEN-small | 3.4M | 140.0 | **0.62** | 6.2e2 |
+- **Task #9 (still pending): "IVI: submit LG long run after flash-attn builds."** The local-global launcher draft at `/tmp/run_pt2_ivi_all6000_lg.sh` (on laptop) still needs `MAX_ATOMS` bumped (4000 → 8000+) and to be uploaded to IVI. Local-global uses scatter for local sub-blocks regardless, so flash only buys the global half; still worth it.
+- **Snellius (running unattended, do NOT touch unless asked):** 6 jobs on 24h walltime, all wd=1e-8 + LS=null + GeLU + chgspin-FiLM + rope_sigma=2.0 + ema=0.99, started 2026-05-16 ~07:30–08:30 UTC. W&B project `omol-leaderboard/scaling-laws-symmetry`.
+  - `22783313` — GeLU baseline resume (from `tasrz3p1`'s last.ckpt, 18.6M, eW1/fW10, MAX_ATOMS=12000)
+  - `22783309` — + qknorm + swiglu (23.5M, eW10/fW20, MAX_ATOMS=12000)
+  - `22783311` — + qknorm + swiglu + use_key (23.5M, eW10/fW20, MAX_ATOMS=12000)
+  - `22783342` — + qknorm + swiglu + **rmsnorm** (23.5M, eW10/fW20, MAX_ATOMS=12000) — this is the "best stack so far" candidate (W&B `lv7akpah`)
+  - `22783550` — + qknorm + swiglu + rmsnorm, **num_layers=16** (46.1M, eW10/fW20, MAX_ATOMS=20000)
+  - `22783551` — + qknorm + swiglu + rmsnorm, **hidden_dim=3840 / nhead=120** (94.1M, eW10/fW20, MAX_ATOMS=20000)
+  - `22783623` — qknorm + swiglu + use_key, **bf16-mixed** + compile=on (26.0M, eW10/fW20, MAX_ATOMS=12000) — twin of `yxh5y61s`/22783311 to revisit the 2026-05-08 bf16 verdict now that qknorm is in the stack.
+  - The L=16 and h=3840 runs are scale-up probes on top of `lv7akpah`. Both at MAX_ATOMS=20000 (Erik's call — H100 fits it at these sizes). With 24h walltime they will get fewer steps (16-layer ≈ 2× slower per step, 3840-hidden ≈ 4× slower) so a resume may be needed to fully complete 20 epochs — flag this if asked.
 
-H100→H200 translation: ~0% for attention models, ~+30% for eSCN/eSEN. So our PT ≈ 3.49 H200-equivalent. Vs paper's full-encoding numbers on H200: AllScAIP-sm 35M = 2.279, AllScAIP-md 85M = 1.124. **Our 18M PT runs ~1.5× faster than AllScAIP-sm and ~3× faster than AllScAIP-md at much smaller size.**
+## Concrete things to do this session
 
-The eSEN-small lag vs the paper's eSEN-sm (~5 ns/day, 6M) is **architectural**, not implementation: our config has lmax=4 (paper lmax=2 → 2.7× SH-coefficient cost), 12 layers (paper ~6), and otf_graph=on (paper precomputes).
+Pick whichever makes the most sense given the day; ask me first if unsure.
 
-## To explore next
+### Option A — Get the LG long run on IVI launched (closes task #9)
 
-### 1. Multi-GPU PT training (revisit)
-A previous session benchmarked 2-GPU DDP at ~1.68× throughput vs 1-GPU on the sig2 recipe (~3.1h/epoch vs ~5.2h). Worth re-running on the current 1920d/sin/EMA recipe and pushing to 4-GPU. Setup recap:
-- Submit with `--gres=gpu:h100:2 --ntasks=1 --cpus-per-task=32 --mem=300G` (single SLURM task — Lightning forks rank 1 itself).
-- `export SLURM_JOB_NAME=bash` before `python` (disables Lightning's SLURM auto-detect).
-- `trainer.devices=N trainer.strategy=ddp` via Hydra.
-- `src/model/omol_module.py` already logs `token_processed`/`total_flops_used` with `sync_dist=True, reduce_fx="sum"` so multi-GPU reports global atoms correctly.
-- The custom batch sampler (`DynamicAtomBatchSamplerForAseDB`) shards itself via `dist.get_rank()/get_world_size()`; set `+trainer.use_distributed_sampler=false` to skip Lightning's auto-sampler injection.
-- A 4-GPU run on hipster died at 1440G mem-request — node ceiling is 770G; cap at 720G if revisited there.
+1. Pull `/tmp/run_pt2_ivi_all6000_lg.sh` from laptop, bump `MAX_ATOMS` to 8000 (or 10000), copy to `ivi_cluster:~/platonic-omol/scripts/`.
+2. Decide: flash-on-global yes/no. `local_global=true` keeps scatter for local sub-blocks, but global can switch to `attention_backend=flash`. The launcher needs `ATTENTION_BACKEND=flash` env var threaded through.
+3. Submit on `all6000` partition. Watch for `flash_attn` import OK + Hydra parse OK in the first 60s of log.
+4. Set a long watcher (use the fresh-SSH-per-poll pattern; IVI auto-kills idle SSH).
 
-### 2. Fair comparison vs eSEN
-Today's comparison was forward-only inference at N=1000 (apples-to-apples for throughput). For a fair *accuracy* comparison we still need to decide what's "fair":
-- **Equal params**: scale eSEN up (more channels/layers — likely beyond our 18M PT target) OR scale PT down. Pick one direction.
-- **Equal batch size (atoms/step)**: PT is at max_atoms=12000, eSEN at 2500 (full 12000 OOMs at lmax=4). To match, either drop PT to max_atoms=2500, or test whether eSEN-small can run at 4000–6000 with activation_checkpointing already on. 5× more steps/epoch at smaller batch will stress the LR schedule — likely needs re-tuned warmup fraction.
-- **Equal compute budget (FLOPs or wall-clock)**: maybe the most defensible. Run eSEN to whatever epoch fits in PT's per-day wall, and report at matched FLOPs.
+### Option B — Quick flash-vs-scatter A/B on IVI
 
-A cleaner eSEN reference matching the paper's "eSEN-sm" recipe (lmax=2, ~6 layers, hidden=128) would also clarify whether the gap is recipe or architecture. Worth building a second config `esen_sm_paper.yaml` and benching.
+To validate flash is actually faster on IVI GPUs (we have hipster Ada numbers but not IVI A6000 numbers): submit two short (1500-step) twin jobs, same recipe, only `ATTENTION_BACKEND` differing. Pulls W&B steady-state ms/step and atoms/sec. If flash wins by ≥1.5× on A6000, all future IVI launchers should default to flash.
 
-### 3. Other items pulled forward
-- Precision-experiment edits in `nets/platoformer/{model,platoformer}.py` are uncommitted on this branch. Decide: land them, revert, or move to a separate branch. They're noise on `git status -s`.
-- `NEXT_SESSION_PROMPT.md` (this file) and `PROGRESS.md` are modified-uncommitted historical notes. Cleanup pass advisable.
+### Option C — Promote qknorm/swiglu/rmsnorm wins from Snellius to an IVI long run
 
-### 4. Leaderboard submission pipeline (still untouched)
-- Figure out npz format for the [FAIR Chemistry Leaderboard](https://huggingface.co/spaces/facebook/fairchem_leaderboard).
-- `test_omol.py` already exists as the full-val entrypoint.
-- Inference script to generate predictions on OMol25 test split + submit to the HF space.
+Wait until Snellius runs are 8–10h in (so they pass step ~5000 and we can pick a winner), then port the winning recipe to a fresh IVI launcher with flash. **This is wait-state today** — flag and check in a few hours rather than running.
+
+## Don't touch
+
+- **Snellius runs** (`22783313`, `22783309`, `22783311`, `22783342`) — they're the experiment, leave them alone.
+- The `upstream-port-pt2` branch on IVI (ahead 21 of origin). Old work; not relevant to this session.
 
 ## How to check status quickly
 
 ```bash
-# Queue + wall
-ssh snellius 'squeue -u ebekkers --format="%.10i %.40j %.8T %.10M %.10L"'
+# IVI queue
+ssh ivi_cluster "squeue -u ebekker"
 
-# Pull recent train_loss / step count from W&B for a specific run
-ssh snellius 'source /scratch-shared/ebekkers/scaling-laws-venv-v2/bin/activate && python3 -c "
-import wandb; api=wandb.Api(); r=api.run(\"omol-leaderboard/scaling-laws-symmetry/<RUNID>\")
-print(r.name, r.state, r.summary.get(\"_runtime\",0), r.summary.get(\"trainer/global_step\",0))"'
+# Snellius queue (only if asked)
+ssh snellius 'squeue -u ebekkers --format="%.10i %.42j %.10T %.10M %.13l"'
 
-# Run the throughput benchmark on a fresh PT or eSEN config
-ssh snellius 'cd /scratch-shared/ebekkers/platonic-omol &&
-  sbatch --job-name=bench-pt2-single  --export=ALL,MODEL=platoformer,MODE=single,N_ATOMS=1000 scripts/run_benchmark_ns_per_day.sh'
+# Flash-attn import check on IVI
+ssh ivi_cluster "source /home/ebekker/platonic-omol/venv/bin/activate && python -c 'import flash_attn; print(flash_attn.__version__)'"
 ```
 
 **Ask me what we're working on today before starting any task.**

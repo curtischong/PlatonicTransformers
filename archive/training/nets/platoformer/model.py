@@ -44,6 +44,9 @@ class PlatonicForceField(nn.Module):
         attention_backend: str = "scatter",
         qk_norm: bool = False,
         swiglu: bool = False,
+        qk_dim_factor: int = 1,
+        v_dim_factor: int = 1,
+        rope_v_independent: bool = False,
         use_key: bool = False,
         norm_type: str = "layernorm",   # "layernorm" or "rmsnorm" (LLaMA-style)
         # Charge/spin conditioning (eSEN/UMA recipe)
@@ -164,6 +167,9 @@ class PlatonicForceField(nn.Module):
             attention_backend=attention_backend,
             qk_norm=qk_norm,
             swiglu=swiglu,
+            qk_dim_factor=qk_dim_factor,
+            v_dim_factor=v_dim_factor,
+            rope_v_independent=rope_v_independent,
             use_key=use_key,
             norm_type=norm_type,
             chgspin_layerwise=chgspin_layerwise,

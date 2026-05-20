@@ -48,6 +48,21 @@ USE_KEY="${USE_KEY:-false}"
 # of LayerNorm for the two per-block normalization layers (pre-attention,
 # pre-FFN). Independent of qk_norm.
 NORM_TYPE="${NORM_TYPE:-layernorm}"
+# QK_DIM_FACTOR: expand Q/K head_dim by this integer factor (V unchanged unless
+# V_DIM_FACTOR is also set). Only supported with ATTENTION_BACKEND=flash.
+QK_DIM_FACTOR="${QK_DIM_FACTOR:-1}"
+# V_DIM_FACTOR: V head_dim factor (and output projection input dim). Must be
+# <= QK_DIM_FACTOR. Default 1 = V unchanged (V padded with zeros to match QK
+# for flash). Set equal to QK_DIM_FACTOR for full expansion without padding.
+V_DIM_FACTOR="${V_DIM_FACTOR:-1}"
+# ROPE_V_INDEPENDENT: when true, V's RoPE uses its own independent learnable
+# frequency bank (decoupled from Q/K's). Doubles spatial-direction coverage at
+# matching head_dim. Only meaningful with rope_on_values=true (default).
+ROPE_V_INDEPENDENT="${ROPE_V_INDEPENDENT:-false}"
+# COMPILE_MODE: torch.compile mode. "default" (current production), "reduce-overhead"
+# (reduces CPU dispatcher cost — modest gain), or "max-autotune" (aggressive fusion
+# search, slower first step but ~10-20% steady-state speedup).
+COMPILE_MODE="${COMPILE_MODE:-default}"
 # PRECISION: Hydra preset name under configs/precision/ — "fp32_baseline" (default,
 # shipped production) or "bf16_h100" (bf16-mixed + TF32 + compile, H100-only).
 PRECISION="${PRECISION:-fp32_baseline}"
@@ -205,7 +220,25 @@ SOLID_TAG=""
 if [ "${SOLID_NAME}" != "tetrahedron" ]; then
     SOLID_TAG="-solid${SOLID_NAME}"
 fi
-EXP_NAME="pt2-h${HIDDEN_DIM}-l${NUM_LAYERS}-${LS_TAG}${FFN_TAG}${ACT_TAG}${RACT_TAG}${OPT_TAG}${RS_TAG}${ROV_TAG}${BACKEND_TAG}${CSM_TAG}${CSL_TAG}${CSF_TAG}${CSI_TAG}${EW_TAG}${FW_TAG}${R_TAG}${LG_TAG}${EMA_TAG}${LR_TAG}${BS_TAG}${SOLID_TAG}-wd${WD_TAG}-20ep-n${MAX_ATOMS}"
+QKN_TAG=""
+if [ "${QK_NORM}" = "true" ]; then QKN_TAG="-qkn"; fi
+SG_TAG=""
+if [ "${SWIGLU}" = "true" ]; then SG_TAG="-sg"; fi
+UK_TAG=""
+if [ "${USE_KEY}" = "true" ]; then UK_TAG="-uk"; fi
+NORMTYPE_TAG=""
+if [ "${NORM_TYPE}" != "layernorm" ]; then NORMTYPE_TAG="-${NORM_TYPE}"; fi
+NHEAD_TAG=""
+if [ "${NHEAD}" != "60" ]; then NHEAD_TAG="-nh${NHEAD}"; fi
+QKDF_TAG=""
+if [ "${QK_DIM_FACTOR}" != "1" ]; then QKDF_TAG="-qkdf${QK_DIM_FACTOR}"; fi
+VDF_TAG=""
+if [ "${V_DIM_FACTOR}" != "1" ]; then VDF_TAG="-vdf${V_DIM_FACTOR}"; fi
+RVI_TAG=""
+if [ "${ROPE_V_INDEPENDENT}" = "true" ]; then RVI_TAG="-rvi"; fi
+CM_TAG=""
+if [ "${COMPILE_MODE}" != "default" ]; then CM_TAG="-cm${COMPILE_MODE}"; fi
+EXP_NAME="pt2-h${HIDDEN_DIM}-l${NUM_LAYERS}-${LS_TAG}${FFN_TAG}${ACT_TAG}${RACT_TAG}${OPT_TAG}${RS_TAG}${ROV_TAG}${BACKEND_TAG}${CSM_TAG}${CSL_TAG}${CSF_TAG}${CSI_TAG}${EW_TAG}${FW_TAG}${R_TAG}${LG_TAG}${EMA_TAG}${LR_TAG}${BS_TAG}${QKN_TAG}${SG_TAG}${UK_TAG}${NORMTYPE_TAG}${NHEAD_TAG}${QKDF_TAG}${VDF_TAG}${RVI_TAG}${CM_TAG}${SOLID_TAG}-wd${WD_TAG}-20ep-n${MAX_ATOMS}"
 
 echo "=== PT-2 20ep (max_atoms=${MAX_ATOMS}): ${EXP_NAME} ==="
 echo "Date:  $(date)"
@@ -249,6 +282,9 @@ OVERRIDES=(
     force_field_module.net.attention_backend=${ATTENTION_BACKEND}
     force_field_module.net.qk_norm=${QK_NORM}
     force_field_module.net.swiglu=${SWIGLU}
+    force_field_module.net.qk_dim_factor=${QK_DIM_FACTOR}
+    force_field_module.net.v_dim_factor=${V_DIM_FACTOR}
+    force_field_module.net.rope_v_independent=${ROPE_V_INDEPENDENT}
     force_field_module.net.use_key=${USE_KEY}
     force_field_module.net.norm_type=${NORM_TYPE}
     force_field_module.net.chgspin_mode=${CHGSPIN_MODE}
@@ -263,6 +299,7 @@ OVERRIDES=(
     # +precision=fp32_baseline sets force_field_module.compile=false; override here
     # so the omol_module compile hook fires on stage=="fit".
     force_field_module.compile=true
+    force_field_module.compile_mode=${COMPILE_MODE}
     "${OPT_OVERRIDES[@]}"
     "${EMA_OVERRIDES[@]}"
     force_field_module.optimizer.lr=${LR}

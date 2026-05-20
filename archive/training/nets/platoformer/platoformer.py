@@ -155,6 +155,9 @@ class PlatonicTransformer(nn.Module):
         attention_backend: str = "scatter",  # "scatter" | "flash"
         qk_norm: bool = False,
         swiglu: bool = False,
+        qk_dim_factor: int = 1,
+        v_dim_factor: int = 1,
+        rope_v_independent: bool = False,
         activation: str = "gelu",
         readout_activation: Optional[str] = None,  # None → fall back to nn.GELU (legacy)
         # Per-block chg/spin conditioning paths (mutually exclusive layerwise vs FiLM):
@@ -224,12 +227,13 @@ class PlatonicTransformer(nn.Module):
                 raise ValueError(
                     f"interaction_radius={interaction_radius} requires dense_mode=False (graph mode)."
                 )
-            if attention_backend == "flash" and not local_global:
+            if attention_backend in ("flash", "flash3") and not local_global:
                 raise ValueError(
                     f"interaction_radius={interaction_radius} without local_global requires "
                     "attention_backend='scatter': single-stream radius attention is fully "
-                    "sparse and flash cannot consume a sparse edge set. With local_global=True "
-                    "flash is used for the global sub-blocks (local sub-blocks force scatter)."
+                    "sparse and flash/flash3 cannot consume a sparse edge set. With "
+                    "local_global=True flash/flash3 is used for the global sub-blocks "
+                    "(local sub-blocks force scatter)."
                 )
             if not attention:
                 raise ValueError("interaction_radius requires attention=True.")
@@ -292,6 +296,9 @@ class PlatonicTransformer(nn.Module):
                 attention_backend=block_backend,
                 qk_norm=qk_norm,
                 swiglu=swiglu,
+                qk_dim_factor=qk_dim_factor,
+                v_dim_factor=v_dim_factor,
+                rope_v_independent=rope_v_independent,
             ))
 
         if ffn_readout:
