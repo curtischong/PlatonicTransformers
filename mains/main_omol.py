@@ -49,10 +49,22 @@ def _cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
-# Performance optimizations
+# Performance optimizations — exact qcczbpfn settings (see baseline-reference/
+# wandb/files/config.yaml).
 torch.set_float32_matmul_precision('high')   # qcczbpfn `matmul_precision: high`
+torch.backends.cudnn.benchmark = False        # qcczbpfn `cudnn_benchmark: false`
+torch.backends.cudnn.deterministic = True     # qcczbpfn `cudnn_deterministic: true`
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
+
+# Dynamo knobs — qcczbpfn applies these whenever compile=True. Without them, the
+# default cache_size_limit=8 trips on PlatonicLinear.forward under dynamic shapes
+# (~11 recompiles seen on snellius), forcing a fall-back to eager mode. Same
+# rationale as hipster's train_omol.py:130-141.
+import torch._dynamo as _dynamo
+_dynamo.config.cache_size_limit = 256
+_dynamo.config.force_parameter_static_shapes = False
+_dynamo.config.capture_scalar_outputs = True
 
 
 class OMolModel(pl.LightningModule):
