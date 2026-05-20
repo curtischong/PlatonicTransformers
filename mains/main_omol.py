@@ -808,7 +808,7 @@ def main(config: ml_collections.ConfigDict) -> None:
         logger=logger,
         max_epochs=config.training.epochs,
         callbacks=callbacks,
-        gradient_clip_val=1.0,
+        gradient_clip_val=float(getattr(config.training, "gradient_clip_val", 1.0)),
         accelerator=accelerator,
         devices=devices,
         enable_progress_bar=config.system.enable_progress_bar,
