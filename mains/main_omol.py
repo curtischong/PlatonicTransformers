@@ -677,7 +677,14 @@ def main(config: ml_collections.ConfigDict) -> None:
     train_loader, val_loader, test_loader, _, _ = get_omol_loaders(
         root=config.dataset.data_dir,
         batch_size=config.training.batch_size,
-        num_workers=2 if config.system.gpus > 1 else config.system.num_workers,
+        # Respect config.system.num_workers regardless of gpus count. The old
+        # "cap at 2 on multi-GPU" line was over-defensive and starved the H100s
+        # on 22950035: GPU SM util went 0 → 60–80 % for ~1 s then sat at 0 for
+        # ~6 s waiting on the dataloader. With 4 ranks × 16 cpus-per-task we
+        # have 64 CPUs total; 16 workers/rank uses them fully (qcczbpfn ran
+        # with 8 workers/rank on hipster and was dataloader-bound only at the
+        # very start).
+        num_workers=config.system.num_workers,
         use_charges=False,
         seed=config.seed,
         debug_subset=config.dataset.debug_subset,
@@ -782,7 +789,11 @@ def main(config: ml_collections.ConfigDict) -> None:
         # per global step → 1 GPU × 3000 × accumulate=4).
         accumulate_grad_batches=int(getattr(
             config.system, "accumulate_grad_batches", 1)),
-        strategy=DDPStrategy(find_unused_parameters=True) if config.system.gpus > 1 else 'auto',
+        # `find_unused_parameters=False`: Lightning warned on iftu53zm that
+        # "find_unused_parameters=True was specified ... did not find any
+        # unused parameters" — i.e. the autograd traversal is pure overhead
+        # here. Disabling it saves ~5–10% per step on multi-GPU.
+        strategy=DDPStrategy(find_unused_parameters=False) if config.system.gpus > 1 else 'auto',
         # Our DynamicAtomBatchSamplerForAseDB is already DDP-aware (shards by
         # rank internally). Lightning would otherwise auto-wrap the loader's
         # sampler with DistributedSampler, which fails for our custom sampler
