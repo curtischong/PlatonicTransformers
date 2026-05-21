@@ -577,8 +577,17 @@ class ESENModel(OMolModel):
 
         from platonic_transformers.models.baseline.esen.eqv_net import EquivariantNet
         m = config.model
+        # Forward the FULL EquivariantNet/eSCNMDBackbone knob set. Previously
+        # only 17 kwargs were passed and the edge-embedding knobs
+        # (edge_channels, num_distance_basis) silently took EquivariantNet's
+        # defaults of 128 / 512 — far larger than the released eSEN-sm's 8 /
+        # 136. That inflated our eSEN-sm by ~1.7M params (7.7M observed vs the
+        # 6.04M of the actual paper-matching config / 6.33M released
+        # checkpoint). Read every knob from config with the released
+        # eSEN-sm-direct value as the getattr default so a config that omits
+        # them still lands on the paper architecture.
         self.net = EquivariantNet(
-            max_num_elements=getattr(m, "max_num_elements", 100),
+            max_num_elements=int(getattr(m, "max_num_elements", 100)),
             sphere_channels=m.sphere_channels,
             hidden_channels=m.hidden_channels,
             lmax=m.lmax,
@@ -595,6 +604,13 @@ class ESENModel(OMolModel):
             act_type=m.act_type,
             ff_type=m.ff_type,
             chg_spin_emb_type=m.chg_spin_emb_type,
+            edge_channels=int(getattr(m, "edge_channels", 8)),
+            distance_function=str(getattr(m, "distance_function", "gaussian")),
+            num_distance_basis=int(getattr(m, "num_distance_basis", 136)),
+            grid_resolution=getattr(m, "grid_resolution", None),
+            num_sphere_samples=int(getattr(m, "num_sphere_samples", 128)),
+            radius_pbc_version=int(getattr(m, "radius_pbc_version", 1)),
+            avg_num_nodes=float(getattr(m, "avg_num_nodes", 26.5)),
         )
 
         # Common buffers + metrics. `scale` initialized to the private's
