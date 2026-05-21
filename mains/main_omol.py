@@ -712,6 +712,21 @@ def main(config: ml_collections.ConfigDict) -> None:
     """Train and evaluate the Platonic Transformer on the OMol dataset."""
     pl.seed_everything(config.seed)
 
+    # eSEN's eSCNMDBackbone trips torch.compile's DDPOptimizer (the
+    # graph-splitter that overlaps grad all-reduce with backward) on multi-
+    # GPU runs: `AttributeError: 'tuple' object has no attribute 'meta'`
+    # inside torch/_dynamo/backends/distributed.py. Disable optimize_ddp
+    # specifically for the eSEN multi-GPU path — torch.compile still runs,
+    # just as one graph, and DDP's standard backward hooks handle gradient
+    # sync (loses a little compute/comm overlap, ~5-10% on this model size,
+    # but avoids the crash). Platonic doesn't hit this, so leave its path
+    # on the default DDPOptimizer.
+    if (str(getattr(config.model, "name", "platoformer")).lower() == "esen"
+            and int(getattr(config.system, "gpus", 1)) > 1):
+        _dynamo.config.optimize_ddp = False
+        print("[main] eSEN + multi-GPU: torch._dynamo.config.optimize_ddp=False "
+              "(works around the DDPOptimizer 'tuple has no attribute meta' crash)")
+
     train_loader, val_loader, test_loader, _, _ = get_omol_loaders(
         root=config.dataset.data_dir,
         batch_size=config.training.batch_size,
