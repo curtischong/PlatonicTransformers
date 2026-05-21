@@ -910,30 +910,49 @@ class DynamicAtomBatchSamplerForAseDB(Sampler):
         self.epoch = 0
         self._atom_count_cache = {}
 
+        # CRITICAL: do NOT resolve rank / num_replicas here. This sampler is
+        # constructed inside get_omol_loaders(), which main() calls BEFORE
+        # trainer.fit() — i.e. before Lightning's DDPStrategy initializes
+        # torch.distributed. If we resolved here, dist.is_initialized() would
+        # be False and every rank would get num_replicas=1, so all ranks
+        # would iterate the FULL dataset identically (no sharding): the 4-GPU
+        # effective batch collapses to one rank's batch, and each epoch runs
+        # world_size× too many steps. Resolve lazily instead — _resolve_dist()
+        # runs from __len__/__iter__, which Lightning calls after DDP init.
+        self._explicit_num_replicas = num_replicas
+        self._explicit_rank = rank
+        self.num_replicas = None
+        self.rank = None
+        self.num_samples = None
+        self.total_size = None
+
+    def _resolve_dist(self):
+        """Resolve rank / num_replicas from torch.distributed (lazily, so it
+        picks up the DDP world that exists at training time, not construction
+        time). Idempotent — safe to call from every __len__/__iter__."""
+        num_replicas = self._explicit_num_replicas
+        rank = self._explicit_rank
         if num_replicas is None:
             if dist.is_available() and dist.is_initialized():
                 num_replicas = dist.get_world_size()
             else:
                 num_replicas = 1
-
         if rank is None:
             if dist.is_available() and dist.is_initialized():
                 rank = dist.get_rank()
             else:
                 rank = 0
-
         if rank < 0 or rank >= num_replicas:
             raise ValueError(f"Invalid rank {rank}, expected in [0, {num_replicas - 1}]")
 
         self.num_replicas = num_replicas
         self.rank = rank
-
         dataset_length = len(self.dataset)
         if self.drop_last:
-            self.num_samples = math.floor(dataset_length / self.num_replicas)
+            self.num_samples = math.floor(dataset_length / num_replicas)
         else:
-            self.num_samples = math.ceil(dataset_length / self.num_replicas)
-        self.total_size = self.num_samples * self.num_replicas
+            self.num_samples = math.ceil(dataset_length / num_replicas)
+        self.total_size = self.num_samples * num_replicas
 
     def set_epoch(self, epoch):
         self.epoch = int(epoch)
@@ -960,6 +979,7 @@ class DynamicAtomBatchSamplerForAseDB(Sampler):
         return num_atoms
 
     def __len__(self):
+        self._resolve_dist()
         if self.max_atoms is None:
             return max(1, math.ceil(self.num_samples / self.max_batch_size))
         avg_atoms_per_graph = 50
@@ -967,6 +987,7 @@ class DynamicAtomBatchSamplerForAseDB(Sampler):
         return max(1, math.ceil(self.num_samples / avg_graphs_per_batch))
 
     def _generate_indices(self):
+        self._resolve_dist()
         size = len(self.dataset)
         if self.shuffle:
             generator = torch.Generator()
