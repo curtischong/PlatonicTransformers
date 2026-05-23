@@ -122,7 +122,6 @@ class PlatonicAPE(nn.Module):
         except KeyError:
             raise ValueError(f"Unknown solid '{solid_name}'. Available options are {list(PLATONIC_GROUPS.keys())}")
         self.num_G = self.group.G
-        self.register_buffer('group_elements', self.group.elements.to(torch.float32))
 
         # --- Dimension Setup ---
         self.embed_dim = embed_dim
@@ -140,6 +139,7 @@ class PlatonicAPE(nn.Module):
         # Frequencies are defined once and then rotated by the group elements.
         # Shape: [spatial_dims, num_frequencies_per_group]
         freqs = torch.randn(self.spatial_dims, self.num_frequencies_g) * freq_sigma
+        self.register_buffer('group_elements', self.group.elements.to(device=freqs.device, dtype=freqs.dtype))
         if learned_freqs:
             self.register_parameter("freqs", nn.Parameter(freqs))
         else:
