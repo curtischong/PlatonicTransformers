@@ -173,3 +173,4 @@ data/qm9/
 # Local baseline-reference dump from hipster (qcczbpfn wandb run dir + metadata.npz)
 # — too large to commit; reference material only.
 baseline-reference/
+*.out
