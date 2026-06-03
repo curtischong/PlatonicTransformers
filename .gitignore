@@ -163,9 +163,12 @@ wandb/
 mains/logs/
 sweeps/wandb/
 run-*.wandb
-
+logs/
+data/
+results/
 # Processed data
 data/qm9/
 
 # Notebook checkpoints
 .ipynb_checkpoints
+scripts/benchmark_attention_backends.py
