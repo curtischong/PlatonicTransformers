@@ -38,6 +38,8 @@ Welcome to the Platonic Transformer project, where geometric group theory meets 
 - 🔳 **Generalizes Standard Transformers** — The standard Transformer architecture is recovered by choosing the trivial symmetry group.
 - 🎯 **Multiple Benchmarks** — CIFAR-10, QM9 regression, ScanObjectNN, and OMol25.
 - ⚡ **Linear-Time Variant** — Dynamic group convolution by dropping softmax.
+- 🧪 **OMol25 Force-Field Training** — Energy/force regression with element references, charge/spin conditioning, EMA, and eSEN baselines.
+- 🚄 **Flash Attention Backends** — Optional FlashAttention-2 and Hopper FlashAttention-3 paths for graph-mode attention.
 - 🛠️ **Easy to Use** — Unified `meta_main.py` entry point for all datasets.
 
 
@@ -83,17 +85,19 @@ python meta_main.py omol --predict_forces --force_weight 100
 │   ├── main_qm9_regr.py
 │   └── main_scanobjectnn.py
 ├── scripts/                 # SLURM job scripts
-│   └── extract_imagenet_to_folder.py 
-│   └── extract_imagenet_to_folder.sh
-│   └── run_dali_test.sh
+│   ├── build_omol_natoms_cache.py
+│   └── run_omol_snellius_tetra.sh
 ├── platonic_transformers/
 │   ├── datasets/            # Dataset loaders for supported benchmarks
 │   ├── models/              # Platonic Transformer building blocks
+│   │   ├── baseline/esen/    # eSEN baseline for OMol experiments
 │   │   ├── ape.py           # Absolute position encoding
 │   │   ├── block.py         # Core PlatonicBlock (attention + feedforward)
 │   │   ├── conv.py          # Group convolution / EdgeConv
+│   │   ├── force_field.py   # OMol force-field wrapper
 │   │   ├── groups.py        # Symmetry group definitions for Platonic solids
 │   │   ├── io.py            # Lifting, pooling, dense/sparse utilities
+│   │   ├── khot_embeddings.py
 │   │   ├── linear.py        # Equivariant linear projections
 │   │   ├── patchifiers.py   # Pluggable patchifier modules (Standard, EdgeConv)
 │   │   └── platoformer.py   # Full PlatonicTransformer module
@@ -110,23 +114,76 @@ python meta_main.py omol --predict_forces --force_weight 100
 - Python 3.12+
 - CUDA 12.1+ (for GPU support)
 - PyTorch 2.3+
+- FlashAttention-2 is optional but recommended for the default fast attention configs.
 
 ### Setup
 
-1. **Clone the repository** and install system dependencies if needed.
-2. **Create the environment:**
-   ```bash
-   chmod +x setup.sh
-   ./setup.sh
-   ```
-3. **Activate the environment:**
-   ```bash
-   source .venv/bin/activate
-   ```
-4. **Authenticate with Weights & Biases** (optional, for experiment tracking):
-   ```bash
-   wandb login
-   ```
+Create a Python 3.12 environment with `uv` or plain `pip`. `uv` is not required, but is faster:
+
+```bash
+uv venv --python 3.12 venv
+source venv/bin/activate
+pip install --upgrade pip wheel setuptools
+```
+
+The `lightning` PyPI package may be unavailable in some environments. If a plain `pip install lightning` fails with `No matching distribution found`, build the matching release from source:
+
+```bash
+git clone --branch 2.5.5 --depth 1 https://github.com/Lightning-AI/pytorch-lightning.git /tmp/pytorch-lightning
+cd /tmp/pytorch-lightning
+PACKAGE_NAME=lightning pip install --no-deps .
+cd -
+```
+
+This provides both the `lightning` and `lightning_fabric` namespaces used by the OMol training code.
+
+Install the rest of the OMol/PT-2 dependencies:
+
+```bash
+pip install hydra-core omegaconf rootutils humanize ase lmdb schedulefree wandb e3nn matplotlib Pillow
+pip install 'git+https://github.com/facebookresearch/fairchem.git@fairchem_core-2.0.0#subdirectory=packages/fairchem-core'
+```
+
+`torch-cluster` and `torch-scatter` may appear in dependency lists, but they are not required for the PT-2 OMol path: `torch_cluster.knn_graph` is guarded by `try/except`, and scatter operations use native `Tensor.scatter_add_`. Skipping them avoids GPU-side compilation failures on login nodes.
+
+Verify the import chain:
+
+```bash
+python -c "import torch, lightning, hydra, schedulefree, fairchem; \
+  from fairchem.core.datasets import AseDBDataset; \
+  print('torch', torch.__version__, 'cuda', torch.version.cuda); \
+  print('lightning', lightning.__version__); \
+  print('AseDBDataset OK')"
+```
+
+### FlashAttention
+
+FlashAttention-2 is recommended for configs that use `attention_backend=flash`. First check your torch/CUDA/ABI combination:
+
+```bash
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, \
+  'cxx11abi', torch._C._GLIBCXX_USE_CXX11_ABI)"
+```
+
+Then install a matching wheel from the [Dao-AILab flash-attention releases](https://github.com/Dao-AILab/flash-attention/releases). For example, for torch 2.6 + CUDA 12 + Python 3.12 + `cxx11abiFALSE`:
+
+```bash
+pip install 'https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1%2Bcu12torch2.6cxx11abiFALSE-cp312-cp312-linux_x86_64.whl'
+```
+
+Verify:
+
+```bash
+python -c "from flash_attn import flash_attn_varlen_func; import flash_attn; print('flash_attn', flash_attn.__version__, 'OK')"
+```
+
+FlashAttention-3 is optional and only targets Hopper GPUs (`sm_90a`, e.g. H100). Build it from the `hopper/` subdirectory of the flash-attention repository and ensure `flash_attn_interface` is importable before using `attention_backend=flash3`.
+
+Authenticate with Weights & Biases if you want experiment tracking:
+
+```bash
+wandb login
+```
 
 
 ## 🎮 Usage
@@ -182,6 +239,9 @@ python mains/main_scanobjectnn.py --model.solid_name=flop_3d_1
 - `--hidden_dim` - Hidden dimension size
 - `--layers` - Number of transformer layers
 - `--num_heads` - Number of attention heads
+- `--model.attention_backend` - Attention backend: `{scatter, flash, flash3}`
+- `--model.qk_norm`, `--model.swiglu`, `--model.activation` - Optional large-model attention/FFN controls
+- `--model.edge_conv_patchify` - Enable EdgeConv patchification for point-cloud workflows
 
   **Note on Hidden Dimension:** For the model to work correctly, `--hidden_dim` must be divisible by both the order of the chosen group (`|G|`) and the specified `--num_heads`. The internal dimensions for attention are calculated automatically from these values.
 
@@ -224,6 +284,8 @@ python mains/main_scanobjectnn.py --model.solid_name=flop_3d_1
 - **Lifting** (`io.py`) - Maps scalar and vector node features to group-aligned channels
 - **Attention Blocks** (`block.py`) - Stacked `PlatonicBlock` layers with group-aware attention and equivariant MLPs
 - **Equivariant Convolutions** (`conv.py`) - SE(3)-equivariant convolution layers
+- **Force-Field Wrapper** (`force_field.py`) - Atomic embedding, charge/spin conditioning, energy/force readout, and fp64 energy reduction for OMol
+- **Charge/Spin Conditioning** (`chg_spin_emb.py`) - Random-Fourier charge/spin embeddings for OMol-style molecular states
 - **Group Theory** (`groups.py`) - Platonic solid symmetry group implementations
 - **Positional Encodings** - Dual encoding strategy:
   - **RoPE** (`rope.py`) - Rotational Positional Encoding for relative positions
@@ -283,11 +345,6 @@ python meta_main.py cifar10 --solid_name dihedral_6 ...
 - **Key Args:** `--dataset.image_size`, `--dataset.patch_size`, `--training.batch_size`
 - **Config:** `configs/imagenet_dali.yaml`
 
-**Running on SLURM (single H100):**
-```bash
-sbatch scripts/run_imagenet_1gpu.sh
-```
-
 **Running directly:**
 ```bash
 python mains/main_imagenet.py \
@@ -298,9 +355,41 @@ python mains/main_imagenet.py \
 > **Note:** ImageNet training requires an NVIDIA DALI installation (`nvidia-dali-cuda120`) and a GPU. The data directory must follow PyTorch ImageFolder layout (`train/<class>/` and `val/<class>/`).
 
 ### Open Molecular (`omol`)
-- **Task:** Molecular Property Prediction with LMDB backend
-- **Features:** Large-scale molecular learning with atomic embeddings
-- **Key Args:** `--radius`, `--max_neighbors`
+- **Task:** OMol25 energy/force regression with ASE-LMDB backends
+- **Features:** Dynamic atom batching, element reference subtraction, charge/spin conditioning, EMA evaluation, optional eSEN baseline, and FlashAttention graph attention
+- **Configs:** `configs/omol.yaml`, `configs/omol_esen.yaml`, `configs/omol_esen_sm.yaml`
+- **Key Args:** `--dataset.train_path`, `--dataset.val_path`, `--model.attention_backend`, `--training.dynamic_batching`, `--model.chgspin_mode`
+
+The default OMol recipe in `configs/omol.yaml` follows the 12k-atoms-per-step H100 recipe:
+
+| Setting | Value |
+|---|---|
+| `hidden_dim` | 1920 |
+| `num_layers` | 16 |
+| `num_heads` | 12 |
+| `solid_name` | `tetrahedron` |
+| `attention_backend` | `flash` |
+| `qk_norm` | `true` |
+| `use_key` | `true` |
+| `activation` | `"sin"` |
+| `rope_sigma` | 2.0 |
+| `rope_on_values` | `true` |
+| `chgspin_mode` | `"add"` |
+| `chgspin_film` | `true` |
+| `lambda_E` / `lambda_F` | 10 / 20 |
+| `EMA` | 0.99 |
+
+For custom OMol shards, build the atom-count cache used by dynamic batching:
+
+```bash
+python scripts/build_omol_natoms_cache.py /path/to/omol/train_or_val_dir
+```
+
+On Snellius, the public release includes the tetrahedron launcher:
+
+```bash
+sbatch scripts/run_omol_snellius_tetra.sh
+```
 
 
 
@@ -340,4 +429,3 @@ For questions or issues:
 
 
 <!-- *🚀🚀🚀Happy Experimenting! 🚀🚀🚀* -->
-

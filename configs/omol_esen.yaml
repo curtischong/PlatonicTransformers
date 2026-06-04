@@ -1,0 +1,97 @@
+# eSEN baseline recipe on OMol25 — Smooth Energy Network (conservative forces).
+#
+# Mirrors our private 22630480 reference run on Snellius:
+#   eSCNMDBackbone (sphere=hidden=32, lmax=4, mmax=2, 12 layers, activation_checkpointing=on)
+#   + MLP_EFS_Head (direct_forces=False → conservative autograd-grad forces)
+#
+# Expected throughput on a single H100, fp32: ~3,330 atoms/sec (vs ~16x faster
+# per atom on the Platonic recipe). 20 epochs ≈ 5 days at max_atoms=2500.
+#
+# Reproduction:
+#   pip install fairchem-core==2.19      # also installs e3nn, e3nn-jax, etc.
+#   sbatch scripts/run_omol_esen.sh
+#
+# Requires `trainer.inference_mode=false` (conservative forces use autograd.grad).
+
+seed: 1
+
+dataset:
+  name: "omol"
+  data_dir: "/opt/datasets/ivi/ivi_omol"
+  split: "main_split"
+  num_workers_preload: 8
+  preload_data: true
+  scalar_features: []
+  vector_features: []
+  debug_subset: null
+  referencing: false
+  include_hof: false
+  scale_shift: false
+  recalculate_stats: false
+  use_khot_encoding: true
+  element_refs_path: "configs/constants/element_refs.yaml"
+
+# Model — eSEN-small (matches private 22630480)
+model:
+  name: "esen"                              # routes to ESENModel + EquivariantNet
+  # eSCNMDBackbone arguments
+  sphere_channels: 32
+  hidden_channels: 32
+  lmax: 4
+  mmax: 2
+  num_layers: 12
+  cutoff: 6.0
+  max_neighbors: 30
+  otf_graph: true
+  direct_forces: false                      # conservative: forces = -∂E/∂pos
+  regress_forces: true
+  regress_stress: false
+  activation_checkpointing: true            # ON to fit lmax=4 / 12 layers in 80GB
+  norm_type: "rms_norm_sh"
+  act_type: "gate"
+  ff_type: "grid"
+  chg_spin_emb_type: "pos_emb"
+
+training:
+  epochs: 20
+  batch_size: 1                             # dt-max_atoms_per_batch=2500 is the cap
+                                            # (full 12000 OOMs at lmax=4); keep
+                                            # batch_size=1 and rely on dataset's
+                                            # atom-based packing for fairness.
+  gradient_clip_val: 1.0
+  train_augm: true
+  lambda_E: 10.0
+  lambda_F: 20.0
+
+optimizer:
+  name: "adamw"
+  lr: 5.0e-4
+  weight_decay: 1.0e-5                      # std eSEN setting
+  ema: false                                # off for baseline parity
+  ema_decay: 0.999
+
+scheduler:
+  name: "cosine"
+  warmup_epochs: 0
+  use_cosine: true
+
+logging:
+  enabled: true
+  project_name: "scaling-laws-symmetry"
+  wandb_run_name: null
+  wandb_identity: "omol-leaderboard"
+  log_every_n_steps: 50
+
+system:
+  gpus: 1
+  num_workers: 4
+  enable_progress_bar: true
+  accumulate_grad_batches: 1
+  strategy: "auto"
+  precision: "32"
+  timer: null
+
+testing:
+  test_ckpt: null
+  resume_ckpt: null
+  load_weights: null

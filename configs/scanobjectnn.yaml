@@ -55,8 +55,7 @@ model:
   scalar_task_level: "graph"
   vector_task_level: "graph"
   ffn_readout: true
-  trivial_readout: false                  # if true, readout uses standard linear layers (symmetry-break at head)
-
+ 
   # Attention block
   mean_aggregation: false
   attention: true

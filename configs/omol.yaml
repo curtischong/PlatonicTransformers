@@ -1,97 +1,164 @@
-# OMol Energy and Force Prediction Configuration
+# OMol25 Energy + Force Prediction — winning Platonic recipe defaults.
+#
+# This config reproduces the "qcczbpfn" winning recipe at our Snellius/hipster
+# evaluations: nh=12, h=1920, L=16, GeLU-MLP FFN with sin activation, LayerScale
+# at 1e-4, charge/spin FiLM conditioning, EMA 0.99, weight_decay 1e-8.
+#
+# To reproduce eSEN baseline instead, override `model.name=esen` and select the
+# eSEN-small recipe in `configs/omol_esen.yaml` (use `--config` override).
 
-seed: 42
+seed: 1
 
 # Dataset configuration
 dataset:
   name: "omol"
-  data_dir: "/opt/datasets/ivi/ivi_omol"
-  split: "main_split" 
+  data_dir: "/opt/datasets/ivi/ivi_omol"   # adjust to your cluster's OMol25 location
+  # qcczbpfn layout: <data_dir>/train_4M/ + <data_dir>/val/  (4M-subset training,
+  # held-out 4M val set). Override these if your shards live under different
+  # subdir names.
+  train_subdir: "train_4M"
+  val_subdir: "val"
+  split: "main_split"
   num_workers_preload: 8
   preload_data: true
-  scalar_features: []  # Additional scalar features, e.g., ["coords", "charges"]
-  vector_features: []  # Additional vector features, e.g., ["coords"]
-  debug_subset: null  # Use a subset for debugging (e.g., 1000)
-  referencing: true  # Use per-atom referencing for target energy
-  include_hof: false  # Normalize target using HOF values
-  scale_shift: false  # Use scale and shift normalization
-  recalculate_stats: false  # Recalculate dataset statistics
-  use_khot_encoding: true  # Use k-hot encoding for atom types
-  
-# Model architecture
+  scalar_features: []  # ["coords", "charges"] to include them as input channels
+  vector_features: []
+  debug_subset: null
+  referencing: false                         # subtract per-element ref energies
+  include_hof: false
+  scale_shift: false
+  recalculate_stats: false
+  use_khot_encoding: true
+  # Path (relative to repo root) to YAML with `oc20_elem_refs:` — per-Z reference
+  # energies. Subtracted from target energy in training/val/test for a flatter
+  # regression target. Set to null to disable.
+  element_refs_path: "configs/constants/element_refs.yaml"
+
+# Model architecture — qcczbpfn winning recipe.
+# Uses `PlatonicForceField` (verbatim port of `nets/platoformer/model.py` in
+# the private repo) — wires atom embedding → optional chgspin input-add →
+# PlatonicTransformer → fp64 per-graph energy reduction → direct force output.
 model:
-  name: "platoformer"
-  hidden_dim: 1152
-  num_layers: 14
-  num_heads: 72
-  solid_name: "tetrahedron"  # Options: tetrahedron, trivial_3, octahedron, icosahedron
-  spatial_dim: 3
-  dense_mode: false
-  predict_forces: true  # If true, direct force prediction; if false, forces from energy gradient
-  
-  # Task configuration (dynamically set based on predict_forces)
-  scalar_task_level: "graph"
-  vector_task_level: "node"  
-  ffn_readout: true
-  
-  # Attention settings
-  mean_aggregation: false
+  name: "platoformer"                       # "platoformer" or "esen" (see omol_esen.yaml)
+  hidden_dim: 1920
+  num_layers: 16
+  num_heads: 12                             # nh=12 = G; head_dim = 1920/12 = 160
+  solid_name: "tetrahedron"                 # |G| = 12
+  dense_mode: false                         # graph mode (PyG batching)
+
+  # Atom embedding
+  atom_embed: "learned"                     # nn.Embedding(max_Z, embed_dim) — qcczbpfn
+  max_num_elements: 100
+  embed_init_std: null                      # null → 1/sqrt(embed_dim)
+  avg_num_nodes: 54.9                       # average atoms on OMol25-4m, use 26.5 for Neutral set.
+
+  # Attention
   attention: true
   dropout: 0.0
   drop_path_rate: 0.0
-  layer_scale_init_value: null
+  layer_scale_init_value: 1.0e-4            # LayerScale ON; also FiLM init γ
   ffn_dim_factor: 4
-  
-  # Positional encoding
-  rope_sigma: 4.0
-  ape_sigma: null
+
+  # RoPE / positional encoding
+  rope_sigma: 2.0
   learned_freqs: true
-  freq_init: "random"  # Options: "random", "spiral"
-  use_key: false
+  freq_init: "random"
+  rope_on_values: true                      # GTA-style: rotate V too, un-rotate output
+  use_key: true
 
-# Training configuration
+  # Hardening flags (LLaMA-3 style)
+  qk_norm: true                             # RMSNorm on Q and K (head_dim)
+  swiglu: false                             # GeLU-MLP FFN (paired with LayerScale ON)
+  activation: "sin"                         # sin FFN activation
+  norm_type: "layernorm"
+  attention_backend: "flash"                # falls back to scatter if flash-attn missing
+  qk_dim_factor: 1
+  v_dim_factor: 1
+  rope_v_independent: false
+  readout_activation: null                  # null → legacy nn.GELU readout
+
+  # Charge/spin conditioning (OMol25, eSEN/UMA recipe)
+  chgspin_mode: "add"                       # "off" | "add" | "concat" — qcczbpfn = "add"
+  chgspin_film: true                        # per-block FiLM modulation
+  chgspin_layerwise: false                  # mutually exclusive with chgspin_film
+  chgspin_layerwise_gate: false
+  chgspin_embed_dim: null                   # null → embed_dim = hidden_dim // |G| = 160
+  chgspin_mix_init_std: 0.02
+
+  # Sparse attention (qcczbpfn uses dense; leave null)
+  interaction_radius: null
+  cutoff_p: 6
+  max_num_neighbors: 1000
+  local_global: false
+
+# Training
 training:
-  epochs: 40
-  batch_size: 32
+  epochs: 20
+  batch_size: 64                            # 1-GPU graph cap (qcczbpfn was 16/rank × 4 ranks)
   gradient_clip_val: 1.0
-  train_augm: true  # Rotation augmentation
-  lambda_F: 5.0  # Weight for force loss
+  train_augm: true                          # rotation augmentation
+  train_augm_group: "o3"                    # qcczbpfn = "o3" (rotation + 50% reflection); use "so3" for rotation only
+  lambda_E: 10.0                            # energy-loss weight (= E_WEIGHT in private)
+  lambda_F: 20.0                            # force-loss weight (= F_WEIGHT in private)
+  # Dynamic batching — packs each batch up to the atom/edge budget. qcczbpfn ran
+  # 4× DDP at 3000 atoms/600k edges per rank ⇒ 12000 atoms/2.4M edges per optimizer
+  # step. On 1× H100 we set the per-batch caps to the full 4-rank total so each
+  # forward+backward is the same effective batch size as qcczbpfn (one big step
+  # instead of 4 micro-steps + all-reduce).
+  dynamic_batching: true
+  max_atoms_per_batch: 12000
+  max_atoms_per_batch_val: 12000
+  max_edges_per_batch: 2400000
+  max_edges_per_batch_val: 2400000
+  # Val cadence (qcczbpfn: val every 5k optimizer steps, capped at 500 batches).
+  val_check_interval: 5000
+  limit_val_batches: 500
+  # torch.compile — qcczbpfn used compile=True with compile_mode="default".
+  # Wraps `self.net` in `Model.setup(stage='fit')`. Disable if debugging.
+  compile: true
+  compile_mode: "default"
+  compile_dynamic: null
 
-# Optimizer configuration
+# Optimizer
 optimizer:
   name: "adamw"
-  lr: 2.0e-4
-  weight_decay: 1.0e-6
-  ema: false  # Exponential moving average
-  ema_decay: 0.999
+  lr: 5.0e-4
+  weight_decay: 1.0e-8                      # qcczbpfn: very small wd, paired with GeLU+sin
+  # EMA matches qcczbpfn's ema/decay=0.99, ema/warmup_steps=2000 — wired via
+  # EMACallback in utils/callbacks.py; swaps EMA weights in at val/test.
+  ema: true
+  ema_decay: 0.99
+  ema_warmup_steps: 2000
 
-# Scheduler configuration
+# Scheduler — qcczbpfn: cosine_annealing_ws with 1% warmup, lr_min=1e-6.
 scheduler:
-  name: "cosine"
-  warmup_epochs: 0
-  use_cosine: true
+  name: "cosine_annealing_ws"
+  num_warmup_steps: 0.01                    # fraction of total steps (qcczbpfn)
+  lr_min: 1.0e-6
 
-# Logging configuration
+# Logging
 logging:
   enabled: true
-  project_name: "Platonic-OMol"
+  project_name: "scaling-laws-symmetry"
   wandb_run_name: null
-  wandb_identity: null
+  wandb_identity: "omol-leaderboard"
   log_every_n_steps: 50
 
-# System configuration
+# System — qcczbpfn ran on 4× RTX 6000 Ada (DDP) with 3000 atoms/rank. This
+# config targets 1× H100 with max_atoms_per_batch=12000 (= 4 × 3000) so each
+# forward+backward already matches qcczbpfn's effective optimizer-step batch.
+# No gradient accumulation needed.
 system:
   gpus: 1
-  num_workers: 0
-  enable_progress_bar: true
+  num_workers: 16
+  enable_progress_bar: false
   accumulate_grad_batches: 1
-  strategy: "auto"  # "ddp" for multi-GPU
-  precision: "32"  # Options: "16-mixed", "bf16-mixed", "32"
-  timer: null  # Timer for training, e.g., "00:08:00:00"
+  strategy: "auto"
+  precision: "32"
+  timer: null
 
 # Testing/checkpointing
 testing:
   test_ckpt: null
   resume_ckpt: null
-  load_weights: null  # Path to load model weights from for a new run
-
+  load_weights: null

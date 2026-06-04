@@ -32,7 +32,6 @@ from platonic_transformers.utils.utils import (
     RandomSO2AroundAxis,
     RandomSOd,
 )
-from mains._optim import make_param_groups
 
 # Performance optimizations
 torch.backends.cuda.enable_flash_sdp(True)
@@ -111,7 +110,6 @@ class ScanObjectNNModel(pl.LightningModule):
             scalar_task_level=config.model.scalar_task_level,
             vector_task_level=config.model.vector_task_level,
             ffn_readout=config.model.ffn_readout,
-            trivial_readout=config.model.get("trivial_readout", False),
             mean_aggregation=config.model.mean_aggregation,
             dropout=config.model.dropout,
             drop_path_rate=config.model.drop_path_rate,
@@ -267,7 +265,25 @@ class ScanObjectNNModel(pl.LightningModule):
         self.log(f"test_macc{suffix}", self.test_metric_macc)
 
     def configure_optimizers(self) -> dict:
-        param_groups = make_param_groups(self, self.config.optimizer.weight_decay)
+        # Standard idiom (ViT / ConvNeXt / GPT / PointNeXt): apply weight_decay
+        # only to weight matrices. Skip:
+        #  - 1D tensors: biases, LayerNorm γ/β, layer_scale gammas — decaying
+        #    fights normalization and shrinks the residual stream.
+        #  - APE/RoPE learnable frequency parameters: decay degrades the
+        #    position encoding by pulling frequencies toward zero.
+        decay_params, no_decay_params = [], []
+        for name, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            is_freq = name.endswith(".freqs") or ".freqs" in name
+            if p.dim() < 2 or name.endswith(".bias") or is_freq:
+                no_decay_params.append(p)
+            else:
+                decay_params.append(p)
+        param_groups = [
+            {"params": decay_params, "weight_decay": self.config.optimizer.weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
         optimizer = torch.optim.AdamW(param_groups, lr=self.config.optimizer.lr)
         scheduler = CosineWarmupScheduler(
             optimizer,

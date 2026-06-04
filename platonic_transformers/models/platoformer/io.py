@@ -1,7 +1,7 @@
 import torch
 from typing import Optional
 
-from platonic_transformers.models.platoformer.utils import scatter_add
+from .utils import scatter_add
 
 
 def lift_scalars(x, group):

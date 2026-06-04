@@ -1,0 +1,127 @@
+# eSEN-sm baseline — paper-matching recipe for the OMol25 leaderboard.
+#
+# Architecture mirrors the released `facebook/OMol25/checkpoints/
+# esen_sm_direct_all.pt` checkpoint (6,333,093 params). Hyperparameters
+# read from `torch.load(ckpt).model_config["backbone"]`. Our from-scratch
+# config measures ~6.04M params — within 5% of the released checkpoint;
+# the small residual is non-architectural head/edge detail.
+#
+# This is the config the production eSEN-sm runs (e.g. wandb zaq6tuhv,
+# 6,037,218 params) actually used — NOT configs/omol_esen.yaml, which is
+# a different, heavier eSEN variant (lmax=4, l=12, h=32) with the bloated
+# edge-embedding defaults (edge_channels=128, num_distance_basis=512).
+#
+# Direct force prediction (direct_forces=true): forces from a dedicated
+# head, no autograd.grad through the energy. Avoids the double-backward
+# that breaks torch.compile and triples activation memory.
+
+seed: 1
+
+dataset:
+  name: "omol"
+  data_dir: "/opt/datasets/ivi/ivi_omol"   # override via --dataset.data_dir
+  train_subdir: "train_4M"
+  val_subdir: "val"
+  split: "main_split"
+  num_workers_preload: 8
+  preload_data: true
+  scalar_features: []
+  vector_features: []
+  debug_subset: null
+  referencing: false
+  include_hof: false
+  scale_shift: false
+  recalculate_stats: false
+  use_khot_encoding: true
+  element_refs_path: "configs/constants/element_refs.yaml"
+
+# Model — eSEN-sm, released-checkpoint architecture.
+model:
+  name: "esen"                              # routes to ESENModel + EquivariantNet
+  max_num_elements: 100
+  # The 3 dominant knobs — matched exactly to esen_sm_direct_all.pt.
+  sphere_channels: 128
+  hidden_channels: 128
+  lmax: 2
+  mmax: 2
+  num_layers: 5
+  # Edge embedding — the released checkpoint uses these (NOT EquivariantNet's
+  # 128 / 512 defaults; those defaults inflated our earlier eSEN-sm to ~7.7M).
+  edge_channels: 8
+  distance_function: "gaussian"
+  num_distance_basis: 136
+  grid_resolution: null
+  num_sphere_samples: 128
+  cutoff: 6.0
+  max_neighbors: 30
+  otf_graph: true
+  radius_pbc_version: 1
+  # Direct forces — see header.
+  direct_forces: true
+  regress_forces: true
+  regress_stress: false
+  activation_checkpointing: true            # backward is the memory bottleneck
+  norm_type: "rms_norm_sh"
+  act_type: "gate"
+  ff_type: "grid"
+  chg_spin_emb_type: "pos_emb"
+  avg_num_nodes: 26.5
+
+# Training
+training:
+  epochs: 20
+  batch_size: 64                            # graph cap; dynamic batching by atoms
+  gradient_clip_val: 1.0
+  train_augm: false                         # eSEN is fully equivariant — no aug
+  lambda_E: 10.0
+  lambda_F: 10.0                            # eSEN-sm recipe: e_weight = f_weight = 10
+  flops_coef: 240
+  # Dynamic batching — packs each batch up to the atom/edge budget.
+  dynamic_batching: true
+  max_atoms_per_batch: 12000
+  max_atoms_per_batch_val: 12000
+  max_edges_per_batch: 2400000
+  max_edges_per_batch_val: 2400000
+  val_check_interval: 5000
+  limit_val_batches: 500
+  # torch.compile works with direct_forces=true (no double backward).
+  compile: true
+  compile_mode: "default"
+  compile_dynamic: null
+
+# Optimizer — eSEN-sm standard.
+optimizer:
+  name: "adamw"
+  lr: 5.0e-4
+  weight_decay: 1.0e-5
+  ema: false                                # off for baseline parity
+
+# Scheduler — cosine_annealing_ws, 1% warmup → cosine decay to lr_min.
+scheduler:
+  name: "cosine_annealing_ws"
+  num_warmup_steps: 0.01
+  lr_min: 1.0e-6
+
+# Logging
+logging:
+  enabled: true
+  project_name: "scaling-laws-symmetry"
+  wandb_run_name: null
+  wandb_identity: "omol-leaderboard"
+  log_every_n_steps: 50
+
+# System
+system:
+  gpus: 1
+  num_workers: 16
+  enable_progress_bar: false
+  accumulate_grad_batches: 1
+  strategy: "auto"
+  precision: "32"
+  timer: null
+
+# Testing/checkpointing
+testing:
+  test_ckpt: null
+  resume_ckpt: null
+  load_weights: null

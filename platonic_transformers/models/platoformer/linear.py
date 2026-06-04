@@ -5,7 +5,7 @@ from torch import Tensor
 import math
 
 # Import the pre-computed group data
-from platonic_transformers.models.platoformer.groups import PLATONIC_GROUPS
+from .groups import PLATONIC_GROUPS
 
 class PlatonicLinear(nn.Module):
     """

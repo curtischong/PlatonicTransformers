@@ -163,12 +163,19 @@ wandb/
 mains/logs/
 sweeps/wandb/
 run-*.wandb
-logs/
-data/
-results/
+
 # Processed data
 data/qm9/
 
 # Notebook checkpoints
 .ipynb_checkpoints
-scripts/benchmark_attention_backends.py
+
+# Local baseline-reference dump from hipster (qcczbpfn wandb run dir + metadata.npz)
+# — too large to commit; reference material only.
+baseline-reference/
+*.out
+scripts/
+logs/
+lightning_logs/
+data/
+INTEGRATION_SUMMARY.md
