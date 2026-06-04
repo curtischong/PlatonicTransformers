@@ -33,11 +33,13 @@ model:
   ffn_dim_factor: 4
   
   # Positional encoding (RoPE and APE)
-  rope_sigma: 16.0
-  ape_sigma: 16.0
+  rope_sigma: 1.0
+  ape_sigma: 10.0
   learned_freqs: true
-  freq_init: "spiral"  # Options: "random", "spiral"
+  freq_init: "random"  # Options: "random", "spiral"
   use_key: false
+  compile: true
+  attention_backend: "flash"
 
 # Training configuration (overrides defaults)
 training:
@@ -69,7 +71,7 @@ logging:
 # System configuration
 system:
   gpus: 1
-  num_workers: 4
+  num_workers: 8
   enable_progress_bar: true
 
 # Testing configuration
