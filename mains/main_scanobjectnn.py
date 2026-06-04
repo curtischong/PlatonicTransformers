@@ -110,7 +110,6 @@ class ScanObjectNNModel(pl.LightningModule):
             scalar_task_level=config.model.scalar_task_level,
             vector_task_level=config.model.vector_task_level,
             ffn_readout=config.model.ffn_readout,
-            trivial_readout=config.model.get("trivial_readout", False),
             mean_aggregation=config.model.mean_aggregation,
             dropout=config.model.dropout,
             drop_path_rate=config.model.drop_path_rate,
