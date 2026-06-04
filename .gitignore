@@ -174,3 +174,7 @@ data/qm9/
 # — too large to commit; reference material only.
 baseline-reference/
 *.out
+scripts/
+logs/
+lightning_logs/
+data/
