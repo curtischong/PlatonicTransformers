@@ -78,6 +78,7 @@ from .utils import scatter_add
 from .rope import PlatonicRoPE
 from .linear import PlatonicLinear
 from .groups import PLATONIC_GROUPS
+from .io import lift_vectors
 
 
 class PlatonicConv(nn.Module):
@@ -670,3 +671,75 @@ class PlatonicConv(nn.Module):
             if edge_index is not None:
                 raise ValueError("edge_index is only supported in graph mode (batch != None).")
             return self._forward_dense(x, pos, mask, avg_num_nodes=avg_num_nodes)
+
+
+class PlatonicEdgeConv(nn.Module):
+    """
+    Group-equivariant EdgeConv-style patchification.
+
+    For each FPS center i and its k nearest dense points j in KNN(i):
+      - compute the relative offset p_j - p_i
+      - lift it to G-equivariant features
+      - concat per-G with upstream embedded point features
+      - run a small platonic MLP per edge
+      - max-pool over j to produce a single feature per center
+    """
+    def __init__(
+        self,
+        kv_in_channels: int,
+        out_channels: int,
+        embed_dim: int,
+        solid_name: str,
+        spatial_dims: int = 3,
+        bias: bool = True,
+        activation: str = "gelu",
+    ):
+        super().__init__()
+        self.group = PLATONIC_GROUPS[solid_name.lower()]
+        self.num_G = self.group.G
+        self.spatial_dims = spatial_dims
+
+        if kv_in_channels % self.num_G != 0:
+            raise ValueError(f"kv_in_channels ({kv_in_channels}) must be divisible by group size ({self.num_G}).")
+        if embed_dim % self.num_G != 0:
+            raise ValueError(f"embed_dim ({embed_dim}) must be divisible by group size ({self.num_G}).")
+        if out_channels % self.num_G != 0:
+            raise ValueError(f"out_channels ({out_channels}) must be divisible by group size ({self.num_G}).")
+
+        self.kv_per_g = kv_in_channels // self.num_G
+
+        offset_in = self.num_G * spatial_dims
+        combined_in = kv_in_channels + offset_in
+
+        _act = {"gelu": nn.GELU, "silu": nn.SiLU, "relu": nn.ReLU}.get(activation, nn.GELU)
+        self.edge_mlp = nn.Sequential(
+            PlatonicLinear(combined_in, embed_dim, solid_name, bias=bias),
+            _act(),
+            PlatonicLinear(embed_dim, embed_dim, solid_name, bias=bias),
+        )
+        self.out_proj = PlatonicLinear(embed_dim, out_channels, solid_name, bias=bias)
+
+    def forward(
+        self,
+        q_pos: Tensor,
+        kv_x: Tensor,
+        kv_pos: Tensor,
+        knn_indices: Tensor,
+    ) -> Tensor:
+        N_q, k = knn_indices.shape
+        idx_flat = knn_indices.reshape(-1)
+
+        kv_local = kv_x[idx_flat].view(N_q, k, -1)
+        kv_local_pos = kv_pos[idx_flat].view(N_q, k, self.spatial_dims)
+        rel_offset = kv_local_pos - q_pos.unsqueeze(1)
+
+        offset_lifted = lift_vectors(rel_offset.unsqueeze(-2), self.group)
+
+        offset_g = offset_lifted.view(N_q, k, self.num_G, self.spatial_dims)
+        kv_g = kv_local.view(N_q, k, self.num_G, self.kv_per_g)
+        combined_g = torch.cat([offset_g, kv_g], dim=-1)
+        combined = combined_g.view(N_q, k, -1)
+
+        edge_features = self.edge_mlp(combined)
+        pooled, _ = edge_features.max(dim=1)
+        return self.out_proj(pooled)
