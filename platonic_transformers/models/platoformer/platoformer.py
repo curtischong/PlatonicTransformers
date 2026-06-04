@@ -9,6 +9,7 @@ from .groups import PLATONIC_GROUPS
 from .linear import PlatonicLinear
 from .io import to_dense_and_mask, pool, lift, to_scalars_vectors
 from .ape import PlatonicAPE as APE
+from .patchifiers import EdgeConvPatchifier
 
 def _radius_graph_python(pos, r, batch, loop=True, max_num_neighbors=None):
     """Pure-PyTorch fallback for torch_cluster.radius_graph.
@@ -179,6 +180,10 @@ class PlatonicTransformer(nn.Module):
         # the radius edge_index (local), the second runs full within-graph
         # attention (global). Requires interaction_radius to be set.
         local_global: bool = False,
+        # EdgeConv patchifier (for point clouds like ScanObjectNN)
+        edge_conv_patchify: bool = False,
+        edge_conv_k: int = 32,
+        fps_ratio: float = 0.0625,
     ):
         super().__init__()
 
@@ -216,6 +221,7 @@ class PlatonicTransformer(nn.Module):
         self.output_dim = output_dim
         self.output_dim_vec = output_dim_vec
         self.mean_aggregation = mean_aggregation
+        self.edge_conv_patchify = edge_conv_patchify
 
         # --- Radius graph configuration ---
         self.interaction_radius = interaction_radius
@@ -252,6 +258,24 @@ class PlatonicTransformer(nn.Module):
         # 1. Input Embedding: Applied before lifting to the group.
         # Maps input features to the per-group-element hidden dimension.
         self.x_embedder = PlatonicLinear((input_dim + input_dim_vec * spatial_dim) * self.num_G, self.hidden_dim, solid_name, bias=False)
+
+        # Optional: in-model EdgeConv patchifier (for point clouds)
+        if edge_conv_patchify:
+            self._edge_conv_patchifier = EdgeConvPatchifier(
+                group=self.group,
+                input_dim=input_dim,
+                input_dim_vec=input_dim_vec,
+                hidden_dim=hidden_dim,
+                spatial_dim=spatial_dim,
+                solid_name=solid_name,
+                ape_sigma=ape_sigma,
+                learned_freqs=learned_freqs,
+                ratio=fps_ratio,
+                k=edge_conv_k,
+                activation=activation,
+            )
+        else:
+            self._edge_conv_patchifier = None
 
         # 2. Equivariant Encoder Layers
         # The blocks operate on the total flattened dimension (G * C).
@@ -367,7 +391,8 @@ class PlatonicTransformer(nn.Module):
                 mask: Optional[Tensor] = None,
                 vec: Optional[Tensor] = None,
                 avg_num_nodes: float = 1.0,
-                chgspin_mixed_per_node: Optional[Tensor] = None) -> Tensor:
+                chgspin_mixed_per_node: Optional[Tensor] = None,
+                return_vectors: bool = True) -> Tensor:
         """
         Forward pass for the Platonic Transformer.
 
@@ -386,25 +411,33 @@ class PlatonicTransformer(nn.Module):
                     or (N, output_dim) for node tasks.
         """
 
-        # 1. Convert to dense format if needed
-        if self.dense_mode:
-            self._input_was_dense_format = (batch is None)
-            # Densify the per-node chg/spin signal alongside x so per-block
-            # injection lines up with the (B, N_max, ...) layout.
-            if chgspin_mixed_per_node is not None and not self._input_was_dense_format:
-                chgspin_mixed_per_node, _, _, _ = to_dense_and_mask(
-                    chgspin_mixed_per_node, None, pos, batch
-                )
-            x, vec, pos, mask = to_dense_and_mask(x, vec, pos, batch)
-            batch = None
-        else:
+        # --- Input adaptation: EdgeConv patchifier OR standard lift+embed ---
+        if self._edge_conv_patchifier is not None:
+            # EdgeConv path: patchifier handles lift, embed, APE, FPS+KNN internally.
+            # Returns dense (x, pos, mask, batch=None).
+            x, pos, mask, batch = self._edge_conv_patchifier(x, vec, pos, batch)
             self._input_was_dense_format = False
-            mask = None
+        else:
+            # Standard path (OMol, QM9, CIFAR-10, etc.) — UNCHANGED.
+            # 1. Convert to dense format if needed
+            if self.dense_mode:
+                self._input_was_dense_format = (batch is None)
+                # Densify the per-node chg/spin signal alongside x so per-block
+                # injection lines up with the (B, N_max, ...) layout.
+                if chgspin_mixed_per_node is not None and not self._input_was_dense_format:
+                    chgspin_mixed_per_node, _, _, _ = to_dense_and_mask(
+                        chgspin_mixed_per_node, None, pos, batch
+                    )
+                x, vec, pos, mask = to_dense_and_mask(x, vec, pos, batch)
+                batch = None
+            else:
+                self._input_was_dense_format = False
+                mask = None
 
-        # 2. Lift scalars and vectors, then embed
-        x = lift(x, vec, self.group)
-        x = self.x_embedder(x)  # [..., N, num_patches * C]
-        x = x + self.ape(pos) if self.ape is not None else x  # Add absolute position embedding
+            # 2. Lift scalars and vectors, then embed
+            x = lift(x, vec, self.group)
+            x = self.x_embedder(x)  # [..., N, num_patches * C]
+            x = x + self.ape(pos) if self.ape is not None else x  # Add absolute position embedding
 
         # Pre-loop: lift the additive chg/spin token once (no per-block projection
         # for the layerwise path, so the same lifted token is reused every block).
@@ -495,14 +528,18 @@ class PlatonicTransformer(nn.Module):
             torch.backends.cuda.matmul.allow_tf32 = False
             torch.backends.cudnn.allow_tf32 = False
             scalar_x = self.scalar_readout(scalar_x.to(readout_dtype))
-            vector_x = self.vector_readout(vector_x.to(readout_dtype))
+            if return_vectors:
+                vector_x = self.vector_readout(vector_x.to(readout_dtype))
         finally:
             torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
             torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
 
         # 5. Extract the scalar and vector parts
         scalars = to_scalars_vectors(scalar_x, self.output_dim, 0, self.group)[0]
-        vectors = to_scalars_vectors(vector_x, 0, self.output_dim_vec, self.group)[1]
+        if return_vectors:
+            vectors = to_scalars_vectors(vector_x, 0, self.output_dim_vec, self.group)[1]
+        else:
+            vectors = None
 
         # Return final result
         return scalars, vectors
