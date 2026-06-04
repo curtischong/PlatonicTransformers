@@ -3,7 +3,7 @@
 #SBATCH --job-name=omol-snellius
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=4
-#SBATCH --time=4-00:00:00
+#SBATCH --time=0-06:00:00
 #SBATCH --mem=250G
 
 set -euo pipefail
